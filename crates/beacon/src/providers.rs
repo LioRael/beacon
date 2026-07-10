@@ -472,6 +472,37 @@ fn tool_executable_name(id: &str) -> &str {
     if id == "rust" { "rustc" } else { id }
 }
 
+fn project_file_contents(name: &str) -> Option<String> {
+    let current = std::env::current_dir().ok()?;
+    current
+        .ancestors()
+        .map(|directory| directory.join(name))
+        .find_map(|path| std::fs::read_to_string(path).ok())
+}
+
+fn project_mise_selects(tool: &str) -> bool {
+    let mise_toml_selects = project_file_contents(".mise.toml")
+        .and_then(|source| toml::from_str::<toml::Value>(&source).ok())
+        .and_then(|value| value.get("tools").and_then(toml::Value::as_table).cloned())
+        .is_some_and(|tools| tools.contains_key(tool));
+    let tool_versions_selects = project_file_contents(".tool-versions").is_some_and(|source| {
+        source.lines().any(|line| {
+            line.split('#')
+                .next()
+                .and_then(|entry| entry.split_whitespace().next())
+                == Some(tool)
+        })
+    });
+    mise_toml_selects || tool_versions_selects
+}
+
+fn project_pins_pnpm() -> bool {
+    project_file_contents("package.json")
+        .and_then(|source| serde_json::from_str::<serde_json::Value>(&source).ok())
+        .and_then(|value| value.get("packageManager")?.as_str().map(str::to_owned))
+        .is_some_and(|manager| manager.starts_with("pnpm@"))
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ManagerKind {
     Homebrew,
@@ -540,7 +571,9 @@ impl BuiltinInstallManager {
             }
             ManagerKind::Npm => {
                 tool.id.as_str() == "npm"
-                    || (tool.id.as_str() == "pnpm" && path.contains("node_modules"))
+                    || (tool.id.as_str() == "pnpm"
+                        && path.contains("node_modules")
+                        && !path.contains("node_modules/corepack"))
             }
             ManagerKind::Corepack => {
                 tool.id.as_str() == "pnpm"
@@ -567,7 +600,11 @@ impl BuiltinInstallManager {
                 ManagerKind::Homebrew => path.contains("/homebrew/"),
                 ManagerKind::Mise => path.contains("/mise/") && path.contains("/installs/"),
                 ManagerKind::Rustup => path.contains("/.cargo/") || path.contains("/rustup/"),
-                ManagerKind::Npm => tool.id.as_str() == "pnpm" && path.contains("node_modules"),
+                ManagerKind::Npm => {
+                    tool.id.as_str() == "pnpm"
+                        && path.contains("node_modules")
+                        && !path.contains("node_modules/corepack")
+                }
                 ManagerKind::Corepack => path.contains("corepack") || path.contains("/shims/"),
                 ManagerKind::BunOfficial => path.contains("/.bun/"),
                 ManagerKind::DenoOfficial => path.contains("/.deno/"),
@@ -759,6 +796,26 @@ impl InstallManager for BuiltinInstallManager {
             }),
             _ => {}
         }
+        match self.kind {
+            ManagerKind::Mise => {
+                for tool in tool_registry() {
+                    let id = tool.id();
+                    if project_mise_selects(id.as_str()) {
+                        evidence.push(ManagerEvidence {
+                            kind: format!("project-policy:{id}"),
+                            value: "project mise selection".into(),
+                        });
+                    }
+                }
+            }
+            ManagerKind::Npm | ManagerKind::Corepack if project_pins_pnpm() => {
+                evidence.push(ManagerEvidence {
+                    kind: "project-policy:pnpm".into(),
+                    value: "project packageManager pin".into(),
+                });
+            }
+            _ => {}
+        }
         Ok(ManagerSnapshot {
             manager: self.id(),
             evidence,
@@ -770,6 +827,9 @@ impl InstallManager for BuiltinInstallManager {
             .evidence
             .iter()
             .any(|evidence| self.receipt_matches(tool, evidence));
+        if self.kind == ManagerKind::Mise && tool.id.as_str() == "pnpm" && !receipt {
+            return ManagerClaims::default();
+        }
         if !self.path_matches(tool) && !receipt {
             return ManagerClaims::default();
         }
@@ -785,16 +845,10 @@ impl InstallManager for BuiltinInstallManager {
                 confidence,
                 evidence: self.claim_evidence(tool, snapshot, receipt, "source"),
             });
-        let project_managed = match self.kind {
-            ManagerKind::Mise => [".mise.toml", ".tool-versions"].iter().any(|name| {
-                std::fs::read_to_string(name)
-                    .is_ok_and(|source| source.lines().any(|line| line.contains(tool.id.as_str())))
-            }),
-            ManagerKind::Corepack => std::fs::read_to_string("package.json").is_ok_and(|source| {
-                source.contains("\"packageManager\"") && source.contains("pnpm@")
-            }),
-            _ => false,
-        };
+        let project_managed = snapshot
+            .evidence
+            .iter()
+            .any(|evidence| evidence.kind == format!("project-policy:{}", tool.id));
         let updater = (self.supports_update(tool) && !project_managed).then(|| UpdaterClaim {
             manager: self.id(),
             confidence,
