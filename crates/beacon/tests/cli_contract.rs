@@ -129,6 +129,76 @@ fn doctor_json_v2_separates_tools_and_inventories() {
 }
 
 #[test]
+fn human_check_shows_source_to_updater_column() {
+    let home = tempfile::tempdir().unwrap();
+    let fixture = tempfile::tempdir().unwrap();
+    let install = fixture.path().join("mise/installs/node/20");
+    let bin = install.join("bin");
+    write_executable(&bin.join("node"), "#!/bin/sh\nprintf 'v20.0.0\\n'\n");
+    write_executable(
+        &bin.join("mise"),
+        &format!(
+            "#!/bin/sh\ncase \"$1 $2\" in\n  'ls --json') printf '{{\"node\":[{{\"version\":\"20\",\"requested_version\":\"20\",\"install_path\":\"{}\"}}]}}\\n' ;;\n  'latest node@20') printf '20.1.0\\n' ;;\nesac\n",
+            install.display()
+        ),
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_beacon"))
+        .args(["check", "--no-color"])
+        .env("HOME", home.path())
+        .env("PATH", &bin)
+        .env("TERM", "dumb")
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("SOURCE → UPDATER"),
+        "human table must show SOURCE → UPDATER: {stdout}"
+    );
+    assert!(
+        stdout.contains("mise → mise")
+            || stdout
+                .lines()
+                .any(|line| line.contains("mise") && line.contains("→")),
+        "human rows must present source → updater ownership: {stdout}"
+    );
+}
+
+#[test]
+fn check_json_keeps_progress_silent_on_stderr() {
+    let home = tempfile::tempdir().unwrap();
+    let path = tempfile::tempdir().unwrap();
+    write_executable(
+        &path.path().join("node"),
+        "#!/bin/sh\nprintf 'v20.0.0\\n'\n",
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_beacon"))
+        .args(["check", "--json"])
+        .env("HOME", home.path())
+        .env("PATH", path.path())
+        .env("TERM", "xterm-256color")
+        .output()
+        .unwrap();
+
+    assert!(
+        output.stderr.is_empty(),
+        "JSON mode must suppress progress on stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["schema_version"], 2);
+    assert!(value["data"]["tools"].is_array());
+}
+
+#[test]
 fn config_show_json_uses_the_v2_envelope() {
     let home = tempfile::tempdir().unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_beacon"))
