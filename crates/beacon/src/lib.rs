@@ -172,6 +172,162 @@ pub mod orchestrator {
     }
 }
 
+pub mod upgrade {
+    use crate::{ToolReport, ToolStatus};
+    use anyhow::{Result, bail};
+
+    pub fn upgrade_candidates(reports: &[ToolReport]) -> Vec<ToolReport> {
+        reports
+            .iter()
+            .filter(|report| report.status == ToolStatus::Outdated && report.action.is_some())
+            .cloned()
+            .collect()
+    }
+
+    pub fn resolve_targets(reports: &[ToolReport], targets: &[String]) -> Result<Vec<ToolReport>> {
+        let actionable = upgrade_candidates(reports);
+        let selected: Vec<_> = actionable
+            .into_iter()
+            .filter(|report| {
+                targets
+                    .iter()
+                    .any(|target| target == &report.id || target == &report.name)
+            })
+            .collect();
+        for target in targets {
+            if reports.iter().any(|report| {
+                (report.id == *target || report.name == *target)
+                    && report.status == ToolStatus::Missing
+            }) {
+                bail!("target `{target}` is not installed; upgrade does not install missing tools");
+            }
+            if !selected
+                .iter()
+                .any(|report| report.id == *target || report.name == *target)
+            {
+                bail!("target `{target}` is not actionable or was not found");
+            }
+        }
+        Ok(selected)
+    }
+}
+
+pub mod ui {
+    use crate::{ToolStatus, command::CommandSpec, runner::CommandOutput};
+    use anyhow::Result;
+    use console::Style;
+    use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
+    use std::{io::IsTerminal, time::Duration};
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum FeedbackMode {
+        Spinner,
+        Plain,
+        Silent,
+        Verbose,
+    }
+
+    impl FeedbackMode {
+        pub fn select(is_tty: bool, json: bool, verbose: bool) -> Self {
+            if verbose {
+                Self::Verbose
+            } else if json {
+                Self::Silent
+            } else if is_tty {
+                Self::Spinner
+            } else {
+                Self::Plain
+            }
+        }
+    }
+
+    pub fn spinner_template(colors: bool) -> &'static str {
+        if colors {
+            "{spinner:.cyan} {msg} {elapsed:.dim}"
+        } else {
+            "{spinner} {msg} {elapsed}"
+        }
+    }
+
+    pub fn status_text(status: ToolStatus, colors: bool, width: usize) -> String {
+        let text = format!("{:<width$}", format!("{status:?}").to_lowercase());
+        let style = match status {
+            ToolStatus::Current => Style::new().green(),
+            ToolStatus::Outdated => Style::new().yellow(),
+            ToolStatus::Missing | ToolStatus::Unavailable => Style::new().yellow(),
+            ToolStatus::Failed => Style::new().red(),
+        };
+        if colors {
+            style.force_styling(true).apply_to(text).to_string()
+        } else {
+            text
+        }
+    }
+
+    pub struct Ui {
+        mode: FeedbackMode,
+        colors: bool,
+    }
+
+    impl Ui {
+        pub fn new(json: bool, verbose: bool, no_color: bool) -> Self {
+            let is_tty = std::io::stderr().is_terminal();
+            let colors = is_tty && !no_color && std::env::var_os("NO_COLOR").is_none();
+            Self {
+                mode: FeedbackMode::select(is_tty, json, verbose),
+                colors,
+            }
+        }
+
+        pub fn mode(&self) -> FeedbackMode {
+            self.mode
+        }
+        pub fn colors(&self) -> bool {
+            self.colors
+        }
+
+        pub fn paint(&self, text: impl std::fmt::Display, style: Style) -> String {
+            if self.colors {
+                style.force_styling(true).apply_to(text).to_string()
+            } else {
+                text.to_string()
+            }
+        }
+
+        pub async fn run_command(
+            &self,
+            label: &str,
+            spec: &CommandSpec,
+            seconds: u64,
+        ) -> Result<CommandOutput> {
+            let spinner = match self.mode {
+                FeedbackMode::Spinner => {
+                    let bar = ProgressBar::with_draw_target(None, ProgressDrawTarget::stderr());
+                    bar.set_style(
+                        ProgressStyle::with_template(spinner_template(self.colors))?
+                            .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]),
+                    );
+                    bar.set_message(label.to_string());
+                    bar.enable_steady_tick(Duration::from_millis(80));
+                    Some(bar)
+                }
+                FeedbackMode::Plain => {
+                    eprintln!("… {label}");
+                    None
+                }
+                FeedbackMode::Silent | FeedbackMode::Verbose => None,
+            };
+            let result =
+                crate::runner::run_with_output(spec, seconds, self.mode == FeedbackMode::Verbose)
+                    .await;
+            if let Some(bar) = spinner {
+                bar.finish_and_clear();
+            }
+            result
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Manager {
@@ -290,8 +446,12 @@ pub mod config {
 pub mod runner {
     use crate::command::CommandSpec;
     use anyhow::{Context, Result, bail};
-    use std::time::Duration;
-    use tokio::{process::Command, time::timeout};
+    use std::{io::Write, process::Stdio, time::Duration};
+    use tokio::{
+        io::{AsyncRead, AsyncReadExt},
+        process::Command,
+        time::timeout,
+    };
 
     #[derive(Debug)]
     pub struct CommandOutput {
@@ -300,17 +460,230 @@ pub mod runner {
     }
 
     pub async fn run(spec: &CommandSpec, seconds: u64) -> Result<CommandOutput> {
+        run_with_output(spec, seconds, false).await
+    }
+
+    pub fn sanitize_verbose_line(line: &str, home: Option<&str>) -> String {
+        crate::redact::redact(line, home)
+    }
+
+    struct StreamingRedactor {
+        pending: Vec<u8>,
+        home: Option<Vec<u8>>,
+        in_secret: bool,
+    }
+
+    impl StreamingRedactor {
+        fn new(home: Option<&str>) -> Self {
+            Self {
+                pending: Vec::new(),
+                home: home
+                    .filter(|value| !value.is_empty())
+                    .map(|value| value.as_bytes().to_vec()),
+                in_secret: false,
+            }
+        }
+
+        fn patterns(&self) -> Vec<(Vec<u8>, bool)> {
+            let mut patterns = vec![
+                (b"token=".to_vec(), true),
+                (b"TOKEN=".to_vec(), true),
+                (b"password=".to_vec(), true),
+                (b"PASSWORD=".to_vec(), true),
+                (b"cookie=".to_vec(), true),
+                (b"COOKIE=".to_vec(), true),
+                (b"Bearer ".to_vec(), true),
+                (b"Basic ".to_vec(), true),
+            ];
+            if let Some(home) = &self.home {
+                patterns.push((home.clone(), false));
+            }
+            patterns
+        }
+
+        fn push(&mut self, chunk: &[u8]) -> Vec<u8> {
+            self.pending.extend_from_slice(chunk);
+            let mut output = Vec::new();
+            loop {
+                if self.in_secret {
+                    if let Some(end) = self
+                        .pending
+                        .iter()
+                        .position(|byte| byte.is_ascii_whitespace())
+                    {
+                        let delimiter = self.pending[end];
+                        self.pending.drain(..=end);
+                        output.push(delimiter);
+                        self.in_secret = false;
+                        continue;
+                    }
+                    self.pending.clear();
+                    break;
+                }
+
+                let patterns = self.patterns();
+                let found = patterns
+                    .iter()
+                    .filter_map(|(pattern, secret)| {
+                        self.pending
+                            .windows(pattern.len())
+                            .position(|window| window == *pattern)
+                            .map(|index| (index, pattern.clone(), *secret))
+                    })
+                    .min_by_key(|(index, _, _)| *index);
+                if let Some((index, pattern, secret)) = found {
+                    output.extend(self.pending.drain(..index));
+                    self.pending.drain(..pattern.len());
+                    if secret {
+                        output.extend_from_slice(&pattern);
+                        output.extend_from_slice(b"[REDACTED]");
+                        self.in_secret = true;
+                    } else {
+                        output.push(b'~');
+                    }
+                    continue;
+                }
+
+                let keep = patterns
+                    .iter()
+                    .map(|(pattern, _)| pattern.len().saturating_sub(1))
+                    .max()
+                    .unwrap_or(0);
+                if self.pending.len() > keep {
+                    let emit = self.pending.len() - keep;
+                    output.extend(self.pending.drain(..emit));
+                }
+                break;
+            }
+            output
+        }
+
+        fn finish(mut self) -> Vec<u8> {
+            if self.in_secret {
+                Vec::new()
+            } else {
+                std::mem::take(&mut self.pending)
+            }
+        }
+
+        #[cfg(test)]
+        fn buffered_len(&self) -> usize {
+            self.pending.len()
+        }
+    }
+
+    async fn capture(
+        mut stream: impl AsyncRead + Unpin,
+        verbose: bool,
+        home: Option<&str>,
+    ) -> Result<Vec<u8>> {
+        let mut captured = Vec::new();
+        let mut redactor = StreamingRedactor::new(home);
+        let mut chunk = [0_u8; 4096];
+        loop {
+            let read = stream.read(&mut chunk).await?;
+            if read == 0 {
+                break;
+            }
+            captured.extend_from_slice(&chunk[..read]);
+            if verbose {
+                std::io::stderr().write_all(&redactor.push(&chunk[..read]))?;
+                std::io::stderr().flush()?;
+            }
+        }
+        if verbose {
+            std::io::stderr().write_all(&redactor.finish())?;
+            std::io::stderr().flush()?;
+        }
+        Ok(captured)
+    }
+
+    pub async fn run_with_output(
+        spec: &CommandSpec,
+        seconds: u64,
+        verbose: bool,
+    ) -> Result<CommandOutput> {
         let mut command = Command::new(&spec.program);
-        command.args(&spec.args).kill_on_drop(true);
-        let output = timeout(Duration::from_secs(seconds), command.output())
-            .await
-            .with_context(|| format!("command timed out: {}", spec.display()))??;
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        if !output.status.success() {
-            bail!("{} failed ({}): {}", spec.display(), output.status, stderr);
+        command
+            .args(&spec.args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        let mut child = command.spawn()?;
+        let stdout = child
+            .stdout
+            .take()
+            .context("failed to capture command stdout")?;
+        let stderr = child
+            .stderr
+            .take()
+            .context("failed to capture command stderr")?;
+        let home = std::env::var("HOME").ok();
+        let (status, stdout, stderr) = timeout(Duration::from_secs(seconds), async {
+            tokio::try_join!(
+                async { Ok::<_, anyhow::Error>(child.wait().await?) },
+                capture(stdout, verbose, home.as_deref()),
+                capture(stderr, verbose, home.as_deref())
+            )
+        })
+        .await
+        .with_context(|| format!("command timed out: {}", spec.display()))??;
+        let stdout = String::from_utf8_lossy(&stdout).trim().to_string();
+        let stderr = String::from_utf8_lossy(&stderr).trim().to_string();
+        if !status.success() {
+            let message = format!("{} failed ({}): {}", spec.display(), status, stderr);
+            bail!("{}", crate::redact::redact(&message, home.as_deref()));
         }
         Ok(CommandOutput { stdout, stderr })
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{StreamingRedactor, run_with_output};
+        use crate::command::CommandSpec;
+
+        #[test]
+        fn streaming_redactor_handles_secrets_split_across_chunks() {
+            let mut redactor = StreamingRedactor::new(Some("/Users/alice"));
+            let mut output = Vec::new();
+            output.extend(redactor.push(b"token=sec"));
+            output.extend(redactor.push(b"ret next /Users/"));
+            output.extend(redactor.push(b"alice/project"));
+            output.extend(redactor.finish());
+            let output = String::from_utf8(output).unwrap();
+
+            assert_eq!(output, "token=[REDACTED] next ~/project");
+        }
+
+        #[test]
+        fn streaming_redactor_emits_bounded_partial_lines() {
+            let mut redactor = StreamingRedactor::new(None);
+            let output = redactor.push(b"downloading a long status without a newline");
+
+            assert!(!output.is_empty());
+            assert!(redactor.buffered_len() < 16);
+        }
+
+        #[tokio::test]
+        async fn nonzero_exit_errors_are_redacted() {
+            let home = std::env::var("HOME").unwrap();
+            let command = CommandSpec::new(
+                "sh",
+                [
+                    "-c",
+                    "printf 'token=secret %s/private' \"$HOME\" >&2; exit 7",
+                ],
+            );
+
+            let error = run_with_output(&command, 5, false)
+                .await
+                .unwrap_err()
+                .to_string();
+
+            assert!(!error.contains("secret"));
+            assert!(!error.contains(&home));
+            assert!(error.contains("[REDACTED]"));
+        }
     }
 }
 

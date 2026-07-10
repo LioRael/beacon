@@ -2,7 +2,7 @@ use crate::{
     Manager, ToolReport, ToolStatus,
     command::CommandSpec,
     config::Config,
-    runner,
+    ui::Ui,
     versions::{manager_for_executable, version_number},
 };
 use anyhow::{Context, Result};
@@ -36,27 +36,49 @@ pub fn find_executable(name: &str) -> Option<PathBuf> {
         .find(|path| path.is_file())
 }
 
-async fn output(program: &str, args: &[&str], config: &Config) -> Result<String> {
-    Ok(runner::run(
-        &CommandSpec::new(program, args.iter().copied()),
-        config.command_timeout_seconds,
-    )
-    .await?
-    .stdout)
+async fn output(
+    program: &str,
+    args: &[&str],
+    config: &Config,
+    ui: &Ui,
+    label: &str,
+) -> Result<String> {
+    Ok(ui
+        .run_command(
+            label,
+            &CommandSpec::new(program, args.iter().copied()),
+            config.command_timeout_seconds,
+        )
+        .await?
+        .stdout)
 }
 
-async fn version(program: &str, args: &[&str], config: &Config) -> Option<String> {
-    output(program, args, config)
+async fn version(
+    program: &str,
+    args: &[&str],
+    config: &Config,
+    ui: &Ui,
+    label: &str,
+) -> Option<String> {
+    output(program, args, config, ui, label)
         .await
         .ok()
         .and_then(|text| version_number(&text))
 }
 
-async fn other_source(tool: &str, active: Manager, config: &Config) -> Vec<String> {
+async fn other_source(tool: &str, active: Manager, config: &Config, ui: &Ui) -> Vec<String> {
     if active == Manager::Mise || find_executable("mise").is_none() {
         return vec![];
     }
-    match output("mise", &["ls", tool], config).await {
+    match output(
+        "mise",
+        &["ls", tool],
+        config,
+        ui,
+        &format!("Checking alternate {tool} installations"),
+    )
+    .await
+    {
         Ok(text) if !text.trim().is_empty() && !text.contains("No versions") => vec![format!(
             "mise: {}",
             text.lines().next().unwrap_or_default().trim()
@@ -84,31 +106,45 @@ fn report(
     other_sources: Vec<String>,
     action: Option<CommandSpec>,
 ) -> ToolReport {
+    let status = status(current.as_ref(), latest.as_ref());
     ToolReport {
         id: id.into(),
         name: name.into(),
-        status: status(current.as_ref(), latest.as_ref()),
+        status,
         current,
         latest,
         manager,
         executable: executable.map(|p| p.to_string_lossy().to_string()),
         other_sources,
         detail: None,
-        action,
+        action: (status != ToolStatus::Missing).then_some(action).flatten(),
     }
 }
 
-pub async fn check_all(config: &Config, refresh: bool) -> Result<Vec<ToolReport>> {
+pub async fn check_all(config: &Config, refresh: bool, ui: &Ui) -> Result<Vec<ToolReport>> {
     let mut reports = Vec::new();
     let brew_available = find_executable("brew").is_some();
     let mut brew_items = HashMap::new();
     if brew_available {
         if refresh {
-            output("brew", &["update"], config)
-                .await
-                .context("Homebrew refresh failed")?;
+            output(
+                "brew",
+                &["update"],
+                config,
+                ui,
+                "Refreshing Homebrew metadata",
+            )
+            .await
+            .context("Homebrew refresh failed")?;
         }
-        let json = output("brew", &["outdated", "--json=v2"], config).await?;
+        let json = output(
+            "brew",
+            &["outdated", "--json=v2"],
+            config,
+            ui,
+            "Checking Homebrew packages",
+        )
+        .await?;
         let outdated: BrewOutdated =
             serde_json::from_str(&json).context("invalid Homebrew outdated response")?;
         for item in outdated.formulae.into_iter().chain(outdated.casks) {
@@ -162,10 +198,17 @@ pub async fn check_all(config: &Config, refresh: bool) -> Result<Vec<ToolReport>
     if config.enabled_tools.iter().any(|t| t == "rust") {
         let executable = find_executable("rustc");
         if executable.is_some() && find_executable("rustup").is_some() {
-            let current = version("rustc", &["--version"], config).await;
-            let active = output("rustup", &["show", "active-toolchain"], config)
-                .await
-                .unwrap_or_else(|_| "stable".into());
+            let current =
+                version("rustc", &["--version"], config, ui, "Reading Rust version").await;
+            let active = output(
+                "rustup",
+                &["show", "active-toolchain"],
+                config,
+                ui,
+                "Reading active Rust toolchain",
+            )
+            .await
+            .unwrap_or_else(|_| "stable".into());
             let channel = active
                 .split_whitespace()
                 .next()
@@ -173,7 +216,7 @@ pub async fn check_all(config: &Config, refresh: bool) -> Result<Vec<ToolReport>
                 .split('-')
                 .next()
                 .unwrap_or("stable");
-            let check = output("rustup", &["check"], config)
+            let check = output("rustup", &["check"], config, ui, "Checking Rust updates")
                 .await
                 .unwrap_or_default();
             let latest = check
@@ -218,17 +261,30 @@ pub async fn check_all(config: &Config, refresh: bool) -> Result<Vec<ToolReport>
             .as_deref()
             .map(manager_for_executable)
             .unwrap_or(Manager::Unknown);
-        let current = version(executable_name, &version_args, config).await;
+        let current = version(
+            executable_name,
+            &version_args,
+            config,
+            ui,
+            &format!("Reading {display} version"),
+        )
+        .await;
         let latest = if manager == Manager::Homebrew {
             brew_items
                 .get(brew_name)
                 .and_then(|i| i.current_version.clone())
                 .or_else(|| current.clone())
         } else if manager == Manager::Mise {
-            output("mise", &["latest", id], config)
-                .await
-                .ok()
-                .and_then(|s| version_number(&s).or(Some(s)))
+            output(
+                "mise",
+                &["latest", id],
+                config,
+                ui,
+                &format!("Checking latest {display} version"),
+            )
+            .await
+            .ok()
+            .and_then(|s| version_number(&s).or(Some(s)))
         } else {
             current.clone()
         };
@@ -247,18 +303,24 @@ pub async fn check_all(config: &Config, refresh: bool) -> Result<Vec<ToolReport>
             latest,
             manager,
             executable,
-            other_source(id, manager, config).await,
+            other_source(id, manager, config, ui).await,
             action,
         ));
     }
 
     if config.enabled_tools.iter().any(|t| t == "npm") {
         let executable = find_executable("npm");
-        let current = version("npm", &["--version"], config).await;
-        let latest = output("npm", &["view", "npm", "version"], config)
-            .await
-            .ok()
-            .and_then(|s| version_number(&s).or(Some(s)));
+        let current = version("npm", &["--version"], config, ui, "Reading npm version").await;
+        let latest = output(
+            "npm",
+            &["view", "npm", "version"],
+            config,
+            ui,
+            "Checking latest npm version",
+        )
+        .await
+        .ok()
+        .and_then(|s| version_number(&s).or(Some(s)));
         reports.push(report(
             "npm",
             "npm",
@@ -276,11 +338,17 @@ pub async fn check_all(config: &Config, refresh: bool) -> Result<Vec<ToolReport>
 
     if config.enabled_tools.iter().any(|t| t == "pnpm") {
         let executable = find_executable("pnpm");
-        let current = version("pnpm", &["--version"], config).await;
-        let latest = output("npm", &["view", "pnpm", "version"], config)
-            .await
-            .ok()
-            .and_then(|s| version_number(&s).or(Some(s)));
+        let current = version("pnpm", &["--version"], config, ui, "Reading pnpm version").await;
+        let latest = output(
+            "npm",
+            &["view", "pnpm", "version"],
+            config,
+            ui,
+            "Checking latest pnpm version",
+        )
+        .await
+        .ok()
+        .and_then(|s| version_number(&s).or(Some(s)));
         let (manager, action) = if let Some(path) = executable.as_deref() {
             let manager = manager_for_executable(path);
             let action = match manager {
@@ -292,19 +360,8 @@ pub async fn check_all(config: &Config, refresh: bool) -> Result<Vec<ToolReport>
                 )),
             };
             (manager, action)
-        } else if config.preferred_install_manager == "homebrew" && brew_available {
-            (
-                Manager::Homebrew,
-                Some(CommandSpec::new("brew", ["install", "pnpm"])),
-            )
         } else {
-            (
-                Manager::Npm,
-                Some(CommandSpec::new(
-                    "npm",
-                    ["install", "--global", "pnpm@latest"],
-                )),
-            )
+            (Manager::Unknown, None)
         };
         reports.push(report(
             "pnpm",
@@ -313,7 +370,7 @@ pub async fn check_all(config: &Config, refresh: bool) -> Result<Vec<ToolReport>
             latest,
             manager,
             executable,
-            other_source("pnpm", manager, config).await,
+            other_source("pnpm", manager, config, ui).await,
             action,
         ));
     }
@@ -324,7 +381,7 @@ pub async fn check_all(config: &Config, refresh: bool) -> Result<Vec<ToolReport>
     Ok(reports)
 }
 
-pub async fn verify(report: &ToolReport, config: &Config) -> Result<Option<String>> {
+pub async fn verify(report: &ToolReport, config: &Config, ui: &Ui) -> Result<Option<String>> {
     let (program, args): (&str, &[&str]) = match report.id.as_str() {
         "rust" => ("rustc", &["--version"]),
         "node" => ("node", &["--version"]),
@@ -334,7 +391,14 @@ pub async fn verify(report: &ToolReport, config: &Config) -> Result<Option<Strin
         id if id.starts_with("brew:") => return Ok(Some("installed".into())),
         _ => return Ok(report.current.clone()),
     };
-    let text = output(program, args, config).await?;
+    let text = output(
+        program,
+        args,
+        config,
+        ui,
+        &format!("Verifying {}", report.name),
+    )
+    .await?;
     Ok(version_number(&text))
 }
 
@@ -348,5 +412,27 @@ pub fn recovery_hint(report: &ToolReport) -> String {
         Manager::Mise => "Run `mise doctor` and `mise current`.".into(),
         Manager::Npm => "Run `npm doctor` and inspect your global prefix.".into(),
         Manager::Unknown => "Inspect PATH and reinstall the tool with its original manager.".into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_reports_never_offer_an_action() {
+        let item = report(
+            "pnpm",
+            "pnpm",
+            None,
+            Some("11.0.0".into()),
+            Manager::Homebrew,
+            None,
+            vec![],
+            Some(CommandSpec::new("brew", ["install", "pnpm"])),
+        );
+
+        assert_eq!(item.status, ToolStatus::Missing);
+        assert!(item.action.is_none());
     }
 }

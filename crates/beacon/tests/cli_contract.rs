@@ -11,6 +11,8 @@ fn exposes_the_v01_command_surface() {
     for command in ["check", "upgrade", "doctor", "history", "config"] {
         assert!(stdout.contains(command), "help did not contain {command}");
     }
+    assert!(stdout.contains("--no-color"));
+    assert!(stdout.contains("--verbose"));
 }
 
 #[test]

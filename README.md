@@ -27,17 +27,21 @@ Node.js, npm, pnpm, and Go.
 ## Commands
 
 ```bash
-beacon check                    # refresh remote metadata and show updates
+beacon check                    # refresh remote metadata with progress feedback
 beacon check --json             # stable schema_version: 1 output
 beacon upgrade                  # interactively select and confirm updates
 beacon upgrade npm --yes        # explicit non-interactive update
+beacon --verbose upgrade npm     # stream the underlying command output
+beacon --no-color doctor         # disable ANSI colors
 beacon doctor --json            # inspect PATH, managers, and duplicate sources
 beacon history --limit 20
 beacon config show
 beacon config set command_timeout_seconds 180
 ```
 
-`upgrade` stops on the first command or verification failure and prints manager-specific recovery guidance. Missing pnpm is offered as an installation through the configured preferred manager.
+`upgrade` lists only installed, outdated tools. Missing tools remain visible in `check` and `doctor`, but Beacon does not install them through `upgrade`. An upgrade stops on the first command or verification failure and prints manager-specific recovery guidance.
+
+Interactive terminals use color and a spinner with the current stage and elapsed time. Redirected human output uses plain stage lines, while `--json` keeps stdout machine-readable and suppresses progress. Set `NO_COLOR` or pass `--no-color` to disable ANSI styling. Verbose child-process output is streamed to stderr after Beacon redacts common credentials and the absolute home directory.
 
 ## Local data
 

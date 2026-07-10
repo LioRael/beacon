@@ -5,10 +5,12 @@ use beacon::{
     envelope::Envelope,
     providers,
     redact::redact,
-    runner,
     store::Store,
+    ui::{Ui, status_text},
+    upgrade::{resolve_targets, upgrade_candidates},
 };
 use clap::{Args, Parser, Subcommand};
+use console::Style;
 use dialoguer::{Confirm, MultiSelect};
 use serde::Serialize;
 use std::{
@@ -24,6 +26,10 @@ use std::{
     about = "A safe development toolchain update manager"
 )]
 struct Cli {
+    #[arg(long, global = true)]
+    no_color: bool,
+    #[arg(long, global = true)]
+    verbose: bool,
     #[command(subcommand)]
     command: Commands,
 }
@@ -103,29 +109,39 @@ fn print_json<T: Serialize>(data: T) -> Result<()> {
     Ok(())
 }
 
-fn print_reports(reports: &[ToolReport]) {
+fn print_reports(reports: &[ToolReport], ui: &Ui) {
     if reports.is_empty() {
         println!("All managed tools are current.");
         return;
     }
     println!(
-        "{:<24} {:<12} {:<14} {:<14} SOURCE",
-        "TOOL", "STATUS", "CURRENT", "LATEST"
+        "{} {} {} {} {}",
+        ui.paint(format!("{:<24}", "TOOL"), Style::new().cyan().bold()),
+        ui.paint(format!("{:<12}", "STATUS"), Style::new().cyan().bold()),
+        ui.paint(format!("{:<14}", "CURRENT"), Style::new().cyan().bold()),
+        ui.paint(format!("{:<14}", "LATEST"), Style::new().cyan().bold()),
+        ui.paint("SOURCE", Style::new().cyan().bold())
     );
     for item in reports {
         println!(
-            "{:<24} {:<12} {:<14} {:<14} {}",
-            item.name,
-            format!("{:?}", item.status).to_lowercase(),
+            "{} {} {:<14} {:<14} {}",
+            ui.paint(format!("{:<24}", item.name), Style::new().cyan()),
+            status_text(item.status, ui.colors(), 12),
             item.current.as_deref().unwrap_or("—"),
             item.latest.as_deref().unwrap_or("—"),
             item.manager
         );
         if let Some(path) = &item.executable {
-            println!("  path: {path}");
+            println!(
+                "  {}",
+                ui.paint(format!("path: {path}"), Style::new().dim())
+            );
         }
         for source in &item.other_sources {
-            println!("  also detected: {source}");
+            println!(
+                "  {}",
+                ui.paint(format!("also detected: {source}"), Style::new().dim())
+            );
         }
         if let Some(detail) = &item.detail {
             println!("  {detail}");
@@ -133,32 +149,10 @@ fn print_reports(reports: &[ToolReport]) {
     }
 }
 
-fn select_targets(reports: &[ToolReport], args: &UpgradeArgs) -> Result<Vec<ToolReport>> {
-    let actionable: Vec<_> = reports
-        .iter()
-        .filter(|r| {
-            matches!(r.status, ToolStatus::Outdated | ToolStatus::Missing) && r.action.is_some()
-        })
-        .cloned()
-        .collect();
+fn select_targets(reports: &[ToolReport], args: &UpgradeArgs, ui: &Ui) -> Result<Vec<ToolReport>> {
+    let actionable = upgrade_candidates(reports);
     if !args.targets.is_empty() {
-        let selected: Vec<_> = actionable
-            .into_iter()
-            .filter(|r| {
-                args.targets
-                    .iter()
-                    .any(|target| target == &r.id || target == &r.name)
-            })
-            .collect();
-        for target in &args.targets {
-            if !selected
-                .iter()
-                .any(|r| &r.id == target || &r.name == target)
-            {
-                bail!("target `{target}` is not actionable or was not found");
-            }
-        }
-        return Ok(selected);
+        return resolve_targets(reports, &args.targets);
     }
     if args.yes || args.json || !std::io::stdin().is_terminal() {
         bail!("non-interactive upgrade requires explicit targets and --yes");
@@ -171,10 +165,13 @@ fn select_targets(reports: &[ToolReport], args: &UpgradeArgs) -> Result<Vec<Tool
         .map(|r| {
             format!(
                 "{}: {} → {} ({})",
-                r.id,
+                ui.paint(&r.id, Style::new().cyan()),
                 r.current.as_deref().unwrap_or("not installed"),
-                r.latest.as_deref().unwrap_or("latest"),
-                r.action.as_ref().unwrap().display()
+                ui.paint(
+                    r.latest.as_deref().unwrap_or("latest"),
+                    Style::new().yellow()
+                ),
+                ui.paint(r.action.as_ref().unwrap().display(), Style::new().dim())
             )
         })
         .collect();
@@ -243,12 +240,15 @@ async fn main() {
 
 async fn run() -> Result<()> {
     let cli = Cli::parse();
+    let no_color = cli.no_color;
+    let verbose = cli.verbose;
     let (mut config, config_path) = config::ensure()?;
     let (db_path, log_path) = paths()?;
     let store = Store::open(&db_path)?;
     match cli.command {
         Commands::Check(args) => {
-            let reports = providers::check_all(&config, true).await?;
+            let ui = Ui::new(args.json, verbose, no_color);
+            let reports = providers::check_all(&config, true, &ui).await?;
             store.snapshot(&reports)?;
             store.record(
                 "check",
@@ -263,11 +263,12 @@ async fn run() -> Result<()> {
             if args.json {
                 print_json(reports)?;
             } else {
-                print_reports(&reports);
+                print_reports(&reports, &ui);
             }
         }
         Commands::Doctor(args) => {
-            let mut reports = providers::check_all(&config, false).await?;
+            let ui = Ui::new(args.json, verbose, no_color);
+            let mut reports = providers::check_all(&config, false, &ui).await?;
             if !args.targets.is_empty() {
                 reports.retain(|r| args.targets.iter().any(|t| t == &r.id || t == &r.name));
             }
@@ -288,15 +289,17 @@ async fn run() -> Result<()> {
             if args.json {
                 print_json(reports)?;
             } else {
-                print_reports(&reports);
+                print_reports(&reports, &ui);
             }
         }
         Commands::Upgrade(args) => {
-            let reports = providers::check_all(&config, true).await?;
-            let selected = select_targets(&reports, &args)?;
+            let ui = Ui::new(args.json, verbose, no_color);
+            let reports = providers::check_all(&config, true, &ui).await?;
+            let selected = select_targets(&reports, &args, &ui)?;
+            let selected_count = selected.len();
             let home = std::env::var("HOME").ok();
             let mut results = Vec::new();
-            for report in selected {
+            for (index, report) in selected.into_iter().enumerate() {
                 let command = report
                     .action
                     .as_ref()
@@ -310,8 +313,17 @@ async fn run() -> Result<()> {
                     continue;
                 }
                 let old = report.current.clone();
-                match runner::run(command, config.command_timeout_seconds).await {
-                    Ok(output) => match providers::verify(&report, &config).await {
+                let label = format!(
+                    "[{}/{}] Upgrading {}",
+                    index + 1,
+                    selected_count,
+                    report.name
+                );
+                match ui
+                    .run_command(&label, command, config.command_timeout_seconds)
+                    .await
+                {
+                    Ok(output) => match providers::verify(&report, &config, &ui).await {
                         Ok(new) => {
                             let summary = redact(
                                 &format!("{} {}", output.stdout, output.stderr),
@@ -406,8 +418,9 @@ async fn run() -> Result<()> {
             } else {
                 for item in results {
                     println!(
-                        "✓ {}: {} → {}",
-                        item.tool,
+                        "{} {}: {} → {}",
+                        ui.paint("✓", Style::new().green()),
+                        ui.paint(&item.tool, Style::new().cyan()),
                         item.old_version.as_deref().unwrap_or("not installed"),
                         item.new_version.as_deref().unwrap_or("installed")
                     );
