@@ -125,6 +125,26 @@ struct UpgradeResult {
     action: providers::UpgradeAction,
 }
 
+#[derive(Default)]
+struct UpgradeBatch {
+    results: Vec<UpgradeResult>,
+    errors: Vec<ErrorDetail>,
+}
+
+impl UpgradeBatch {
+    fn exit_code(&self) -> i32 {
+        upgrade_exit_code(self.results.len(), self.errors.len())
+    }
+}
+
+fn upgrade_exit_code(result_count: usize, error_count: usize) -> i32 {
+    match (result_count == 0, error_count == 0) {
+        (_, true) => 0,
+        (true, false) => 1,
+        (false, false) => 2,
+    }
+}
+
 fn paths() -> Result<(PathBuf, PathBuf)> {
     let app = config::app_dir()?;
     let home = std::env::var_os("HOME").context("HOME is not set")?;
@@ -612,7 +632,7 @@ async fn run(cli: Cli) -> Result<i32> {
             let data = providers::check_all(&config, true, &ui).await?;
             let selected = select_targets(&data, &args, &ui)?;
             let home = std::env::var("HOME").ok();
-            let mut results = Vec::new();
+            let mut batch = UpgradeBatch::default();
             for (index, plan) in selected.iter().enumerate() {
                 if !args.yes
                     && !Confirm::new()
@@ -710,14 +730,17 @@ async fn run(cli: Cli) -> Result<i32> {
                                 summary
                             ),
                         )?;
-                        bail!(
-                            "upgrade failed for {}. {}",
-                            plan.id,
-                            plan.tool
-                                .as_ref()
-                                .map(providers::recovery_hint)
-                                .unwrap_or_else(|| "Run `brew doctor`.".into())
-                        );
+                        let recovery = plan
+                            .tool
+                            .as_ref()
+                            .map(providers::recovery_hint)
+                            .unwrap_or_else(|| "Run `brew doctor`.".into());
+                        batch.errors.push(ErrorDetail::new(
+                            "upgrade_failed",
+                            Some(format!("tool:{}", plan.id)),
+                            format!("upgrade failed. {recovery}"),
+                        ));
+                        break;
                     }
                 };
                 let summary = redact(
@@ -743,7 +766,7 @@ async fn run(cli: Cli) -> Result<i32> {
                         summary
                     ),
                 )?;
-                results.push(UpgradeResult {
+                batch.results.push(UpgradeResult {
                     tool: plan.id.clone(),
                     old_version: plan.current.clone(),
                     new_version,
@@ -754,12 +777,18 @@ async fn run(cli: Cli) -> Result<i32> {
                 });
             }
             store.prune(config.history_limit)?;
+            let exit_code = batch.exit_code();
             if args.json {
-                print_envelope(&Envelope::ok(results))?;
-            } else if results.is_empty() {
+                match exit_code {
+                    0 => print_envelope(&Envelope::ok(batch.results))?,
+                    1 => print_envelope(&Envelope::error(batch.results, batch.errors))?,
+                    2 => print_envelope(&Envelope::partial(batch.results, batch.errors))?,
+                    _ => unreachable!(),
+                }
+            } else if batch.results.is_empty() && batch.errors.is_empty() {
                 println!("No updates selected.");
             } else {
-                for item in results {
+                for item in batch.results {
                     println!(
                         "{} {}: {} → {}",
                         ui.paint("✓", Style::new().green()),
@@ -768,7 +797,15 @@ async fn run(cli: Cli) -> Result<i32> {
                         item.new_version.as_deref().unwrap_or("unknown")
                     );
                 }
+                if let Some(error) = batch.errors.first() {
+                    eprintln!(
+                        "error: {}: {}",
+                        error.target.as_deref().unwrap_or("upgrade"),
+                        error.message
+                    );
+                }
             }
+            return Ok(exit_code);
         }
         Commands::History(args) => {
             let entries = store.history(args.limit)?;
@@ -800,4 +837,16 @@ async fn run(cli: Cli) -> Result<i32> {
         },
     }
     Ok(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::upgrade_exit_code;
+
+    #[test]
+    fn upgrade_exit_codes_distinguish_success_fatal_and_partial_results() {
+        assert_eq!(upgrade_exit_code(2, 0), 0);
+        assert_eq!(upgrade_exit_code(0, 1), 1);
+        assert_eq!(upgrade_exit_code(1, 1), 2);
+    }
 }
