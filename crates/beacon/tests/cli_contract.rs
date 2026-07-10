@@ -251,7 +251,10 @@ fn cli_migrates_v1_config_with_backup_and_stays_idempotent() {
     );
     let value: serde_json::Value = serde_json::from_slice(&first.stdout).unwrap();
     assert_eq!(value["data"]["schema_version"], 2);
-    assert_eq!(value["data"]["enabled_tools"], serde_json::json!(["node", "rust"]));
+    assert_eq!(
+        value["data"]["enabled_tools"],
+        serde_json::json!(["node", "rust"])
+    );
     assert_eq!(
         value["data"]["enabled_inventories"],
         serde_json::json!(["homebrew"])
@@ -267,11 +270,13 @@ fn cli_migrates_v1_config_with_backup_and_stays_idempotent() {
     assert!(migrated.contains("schema_version = 2"));
     assert!(migrated.contains("enabled_inventories = [\"homebrew\"]"));
     assert!(!migrated.contains("preferred_install_manager"));
-    assert!(!value["data"]["enabled_tools"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|tool| tool == "homebrew"));
+    assert!(
+        !value["data"]["enabled_tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tool| tool == "homebrew")
+    );
     assert_eq!(backup, original);
     assert!(!path.with_file_name("config.toml.tmp").exists());
     assert!(!path.with_file_name("config.toml.v1.bak.tmp").exists());
