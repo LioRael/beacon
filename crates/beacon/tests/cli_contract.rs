@@ -9,6 +9,38 @@ fn write_executable(path: &std::path::Path, body: &str) {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
 }
 
+fn check_json(
+    home: &std::path::Path,
+    bin: &std::path::Path,
+    current_dir: Option<&std::path::Path>,
+) -> serde_json::Value {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_beacon"));
+    command
+        .args(["check", "--json"])
+        .env("HOME", home)
+        .env("PATH", bin);
+    if let Some(current_dir) = current_dir {
+        command.current_dir(current_dir);
+    }
+    let output = command.output().unwrap();
+    assert!(
+        output.status.success(),
+        "stderr={} stdout={}",
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
+    );
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
+fn tool_report<'a>(value: &'a serde_json::Value, tool: &str) -> &'a serde_json::Value {
+    value["data"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["id"] == tool)
+        .unwrap()
+}
+
 #[test]
 fn exposes_the_v01_command_surface() {
     let output = Command::new(env!("CARGO_BIN_EXE_beacon"))
@@ -494,4 +526,147 @@ fn global_mise_pnpm_preserves_selector_in_latest_and_upgrade_action() {
         pnpm["update"]["action"]["command"]["args"],
         serde_json::json!(["use", "-g", "pnpm@lts"])
     );
+}
+
+#[test]
+fn official_bun_and_deno_report_safe_channel_specific_actions() {
+    for (tool, current, latest, manager, mode, expected_args) in [
+        (
+            "bun",
+            "1.2.0",
+            "1.2.1",
+            "bun-official",
+            "floating",
+            serde_json::json!(["upgrade"]),
+        ),
+        (
+            "deno",
+            "2.1.0",
+            "2.1.1",
+            "deno-official",
+            "exact",
+            serde_json::json!(["upgrade", "--version", "2.1.1"]),
+        ),
+    ] {
+        let home = tempfile::tempdir().unwrap();
+        let fixture = tempfile::tempdir().unwrap();
+        let bin = fixture.path().join(format!(".{tool}/bin"));
+        let tool_body = if tool == "deno" {
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = upgrade ]; then printf 'A new release of Deno is available: {latest}\\n'; else printf 'deno {current}\\n'; fi\n"
+            )
+        } else {
+            format!("#!/bin/sh\nprintf '{current}\\n'\n")
+        };
+        write_executable(&bin.join(tool), &tool_body);
+        if tool == "bun" {
+            write_executable(
+                &bin.join("curl"),
+                &format!("#!/bin/sh\nprintf '{{\"tag_name\":\"bun-v{latest}\"}}\\n'\n"),
+            );
+        }
+
+        let value = check_json(home.path(), &bin, None);
+        assert_eq!(value["schema_version"], 2);
+        let report = tool_report(&value, tool);
+        assert_eq!(report["status"], "outdated");
+        assert_eq!(report["installation"]["source"], manager);
+        assert_eq!(report["update"]["manager"], manager);
+        assert_eq!(report["update"]["action"]["target_mode"], mode);
+        assert_eq!(report["update"]["action"]["command"]["args"], expected_args);
+    }
+}
+
+#[test]
+fn homebrew_and_global_mise_manage_bun_and_deno_through_shared_claims() {
+    for tool in ["bun", "deno"] {
+        for manager in ["homebrew", "mise"] {
+            let home = tempfile::tempdir().unwrap();
+            let fixture = tempfile::tempdir().unwrap();
+            let bin = if manager == "homebrew" {
+                fixture.path().join("homebrew/bin")
+            } else {
+                fixture
+                    .path()
+                    .join(format!("mise/installs/{tool}/1.2.0/bin"))
+            };
+            write_executable(
+                &bin.join(tool),
+                &format!("#!/bin/sh\nprintf '{tool} 1.2.0\\n'\n"),
+            );
+            if manager == "homebrew" {
+                write_executable(
+                    &bin.join("brew"),
+                    &format!(
+                        "#!/bin/sh\nif [ \"$1\" = update ]; then exit 0;\nelif [ \"$1\" = list ] && [ \"$2\" = --formula ]; then printf '{tool} 1.2.0\\n';\nelif [ \"$1\" = list ] && [ \"$2\" = --cask ]; then exit 0;\nelif [ \"$1\" = --prefix ]; then printf '{}\\n';\nelif [ \"$1\" = info ]; then printf '{{\"formulae\":[{{\"versions\":{{\"stable\":\"1.2.1\"}}}}],\"casks\":[]}}\\n';\nelif [ \"$1\" = outdated ]; then printf '{{\"formulae\":[],\"casks\":[]}}\\n';\nelse exit 1; fi\n",
+                        fixture.path().join("homebrew").display()
+                    ),
+                );
+            } else {
+                write_executable(
+                    &bin.join("mise"),
+                    &format!(
+                        "#!/bin/sh\nif [ \"$1\" = ls ]; then printf '{{\"{tool}\":[{{\"version\":\"1.2.0\",\"requested_version\":\"latest\",\"install_path\":\"{}\"}}]}}\\n'; else printf '1.2.1\\n'; fi\n",
+                        fixture
+                            .path()
+                            .join(format!("mise/installs/{tool}/1.2.0"))
+                            .display()
+                    ),
+                );
+            }
+
+            let value = check_json(home.path(), &bin, None);
+            let report = tool_report(&value, tool);
+            assert_eq!(report["status"], "outdated", "{tool} via {manager}");
+            assert_eq!(report["installation"]["source"], manager);
+            assert_eq!(report["update"]["manager"], manager);
+        }
+    }
+}
+
+#[test]
+fn bun_and_deno_stay_unmanaged_without_reliable_or_global_provenance() {
+    for (tool, project_mise) in [("bun", false), ("deno", true)] {
+        let home = tempfile::tempdir().unwrap();
+        let fixture = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let bin = if project_mise {
+            fixture
+                .path()
+                .join(format!("mise/installs/{tool}/1.2.0/bin"))
+        } else {
+            fixture.path().join("custom/bin")
+        };
+        write_executable(
+            &bin.join(tool),
+            &format!("#!/bin/sh\nprintf '{tool} 1.2.0\\n'\n"),
+        );
+        if project_mise {
+            write_executable(
+                &bin.join("mise"),
+                &format!(
+                    "#!/bin/sh\nif [ \"$1\" = ls ]; then printf '{{\"{tool}\":[{{\"version\":\"1.2.0\",\"install_path\":\"{}\"}}]}}\\n'; else exit 99; fi\n",
+                    fixture
+                        .path()
+                        .join(format!("mise/installs/{tool}/1.2.0"))
+                        .display()
+                ),
+            );
+            std::fs::write(
+                project.path().join(".mise.toml"),
+                format!("[tools]\n{tool} = \"1.2.0\"\n"),
+            )
+            .unwrap();
+        }
+
+        let value = check_json(home.path(), &bin, Some(project.path()));
+        let report = tool_report(&value, tool);
+        assert_eq!(report["status"], "unmanaged");
+        assert!(report["update"].is_null());
+        if project_mise {
+            assert_eq!(report["installation"]["source"], "mise");
+        } else {
+            assert!(report["installation"]["source"].is_null());
+        }
+    }
 }
