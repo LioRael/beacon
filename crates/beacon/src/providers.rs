@@ -350,6 +350,7 @@ where
 #[async_trait]
 pub trait InstallManager: Send + Sync {
     fn id(&self) -> ManagerId;
+    fn applies_to_path(&self, tool: &DetectedTool) -> bool;
     async fn snapshot(
         &self,
         context: &ProviderContext<'_>,
@@ -503,6 +504,46 @@ fn project_pins_pnpm() -> bool {
         .is_some_and(|manager| manager.starts_with("pnpm@"))
 }
 
+fn executable_on_path(name: &str) -> Option<PathBuf> {
+    std::env::var_os("PATH").and_then(|path| {
+        std::env::split_paths(&path)
+            .map(|directory| directory.join(name))
+            .find(|candidate| candidate.is_file())
+    })
+}
+
+#[cfg(unix)]
+fn same_file(left: &std::path::Path, right: Option<PathBuf>) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let (Ok(left), Some(Ok(right))) = (std::fs::metadata(left), right.map(std::fs::metadata))
+    else {
+        return false;
+    };
+    left.dev() == right.dev() && left.ino() == right.ino()
+}
+
+#[cfg(not(unix))]
+fn same_file(_left: &std::path::Path, _right: Option<PathBuf>) -> bool {
+    false
+}
+
+fn mise_selector<'a>(tool: &DetectedTool, snapshot: &'a ManagerSnapshot) -> Option<&'a str> {
+    let active =
+        std::fs::canonicalize(&tool.executable).unwrap_or_else(|_| PathBuf::from(&tool.executable));
+    snapshot
+        .evidence
+        .iter()
+        .filter(|item| item.kind == format!("selector:{}", tool.id))
+        .find_map(|item| {
+            let Some((install_path, selector)) = item.value.rsplit_once(' ') else {
+                return Some(item.value.as_str());
+            };
+            let install_path =
+                std::fs::canonicalize(install_path).unwrap_or_else(|_| PathBuf::from(install_path));
+            active.starts_with(install_path).then_some(selector)
+        })
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ManagerKind {
     Homebrew,
@@ -521,6 +562,13 @@ struct BuiltinInstallManager {
 }
 
 impl BuiltinInstallManager {
+    fn requires_matching_receipt(&self, tool: &DetectedTool) -> bool {
+        self.kind == ManagerKind::Rustup
+            || (tool.id.as_str() == "go"
+                && matches!(self.kind, ManagerKind::Homebrew | ManagerKind::Mise))
+            || (self.kind == ManagerKind::Mise && tool.id.as_str() == "pnpm")
+    }
+
     fn receipt_matches(&self, tool: &DetectedTool, evidence: &ManagerEvidence) -> bool {
         if !evidence.kind.starts_with("receipt")
             || evidence.value.split_whitespace().next() != Some(tool.id.as_str())
@@ -657,6 +705,10 @@ impl InstallManager for BuiltinInstallManager {
         ManagerId::new(self.id).expect("valid built-in manager ID")
     }
 
+    fn applies_to_path(&self, tool: &DetectedTool) -> bool {
+        self.path_matches(tool)
+    }
+
     async fn snapshot(
         &self,
         context: &ProviderContext<'_>,
@@ -774,15 +826,17 @@ impl InstallManager for BuiltinInstallManager {
                                     value: tool.clone(),
                                 });
                             }
-                            if let Some(entry) = entries.and_then(|entries| entries.first()) {
-                                if let Some(selector) = entry
-                                    .get("requested_version")
-                                    .or_else(|| entry.get("version"))
-                                    .and_then(|value| value.as_str())
-                                {
+                            for entry in entries.into_iter().flatten() {
+                                if let (Some(install_path), Some(selector)) = (
+                                    entry.get("install_path").and_then(|value| value.as_str()),
+                                    entry
+                                        .get("requested_version")
+                                        .or_else(|| entry.get("version"))
+                                        .and_then(|value| value.as_str()),
+                                ) {
                                     evidence.push(ManagerEvidence {
                                         kind: format!("selector:{tool}"),
-                                        value: selector.into(),
+                                        value: format!("{install_path} {selector}"),
                                     });
                                 }
                             }
@@ -790,10 +844,37 @@ impl InstallManager for BuiltinInstallManager {
                     }
                 }
             }
-            ManagerKind::Rustup => evidence.push(ManagerEvidence {
-                kind: "receipt".into(),
-                value: "rust".into(),
-            }),
+            ManagerKind::Rustup => {
+                let channel = redacted
+                    .split_whitespace()
+                    .next()
+                    .context("rustup snapshot had no active channel")?;
+                let rustc = context
+                    .execute(
+                        "Resolving active rustup rustc",
+                        &CommandSpec::new("rustup", ["which", "rustc", "--toolchain", channel]),
+                    )
+                    .await?;
+                let rustc = rustc.stdout.trim();
+                if rustc.is_empty() {
+                    bail!("rustup active channel did not resolve rustc");
+                }
+                let cargo_proxy = std::env::var("HOME")
+                    .ok()
+                    .map(|home| PathBuf::from(home).join(".cargo/bin/rustc"))
+                    .filter(|proxy| same_file(proxy, executable_on_path("rustup")));
+                evidence.push(ManagerEvidence {
+                    kind: "receipt".into(),
+                    value: format!(
+                        "rust {}{}",
+                        rustc,
+                        cargo_proxy
+                            .as_ref()
+                            .map(|path| format!(" {}", path.display()))
+                            .unwrap_or_default()
+                    ),
+                });
+            }
             _ => {}
         }
         match self.kind {
@@ -827,7 +908,7 @@ impl InstallManager for BuiltinInstallManager {
             .evidence
             .iter()
             .any(|evidence| self.receipt_matches(tool, evidence));
-        if self.kind == ManagerKind::Mise && tool.id.as_str() == "pnpm" && !receipt {
+        if self.requires_matching_receipt(tool) && !receipt {
             return ManagerClaims::default();
         }
         if !self.path_matches(tool) && !receipt {
@@ -868,12 +949,7 @@ impl InstallManager for BuiltinInstallManager {
                 CommandSpec::new("brew", ["info", "--json=v2", tool.id.as_str()])
             }
             ManagerKind::Mise => {
-                let selector = snapshot
-                    .evidence
-                    .iter()
-                    .find(|item| item.kind == format!("selector:{}", tool.id))
-                    .map(|item| item.value.as_str())
-                    .unwrap_or("latest");
+                let selector = mise_selector(tool, snapshot).unwrap_or("latest");
                 CommandSpec::new("mise", ["latest", &format!("{}@{selector}", tool.id)])
             }
             ManagerKind::Rustup => CommandSpec::new("rustup", ["check"]),
@@ -996,12 +1072,7 @@ impl InstallManager for BuiltinInstallManager {
                 TargetMode::Floating,
             ),
             ManagerKind::Mise => {
-                let selector = snapshot
-                    .evidence
-                    .iter()
-                    .find(|item| item.kind == format!("selector:{}", tool.id))
-                    .map(|item| item.value.as_str())
-                    .unwrap_or("latest");
+                let selector = mise_selector(tool, snapshot).unwrap_or("latest");
                 (
                     CommandSpec::new("mise", ["use", "-g", &format!("{}@{selector}", tool.id)]),
                     TargetMode::Floating,
@@ -1102,6 +1173,24 @@ fn empty_snapshot(manager: &dyn InstallManager) -> ManagerSnapshot {
     }
 }
 
+fn failed_snapshot(manager: &dyn InstallManager, error: anyhow::Error) -> ManagerSnapshot {
+    ManagerSnapshot {
+        manager: manager.id(),
+        evidence: vec![ManagerEvidence {
+            kind: "snapshot-error".into(),
+            value: error.to_string(),
+        }],
+    }
+}
+
+fn snapshot_failure(manager: &dyn InstallManager, snapshot: &ManagerSnapshot) -> Option<String> {
+    snapshot
+        .evidence
+        .iter()
+        .find(|evidence| evidence.kind == "snapshot-error")
+        .map(|error| format!("{} manager query failed: {}", manager.id(), error.value))
+}
+
 type SnapshotCache = Arc<HashMap<String, OnceCell<Option<ManagerSnapshot>>>>;
 
 fn manager_executable(manager: &dyn InstallManager) -> &'static str {
@@ -1146,7 +1235,8 @@ async fn prefetch_snapshots(refresh: bool, context: &ProviderContext<'_>, cache:
                         },
                     )
                     .await
-                    .ok()
+                    .map(Some)
+                    .unwrap_or_else(|error| Some(failed_snapshot(manager, error)))
             })
             .await;
         }
@@ -1161,8 +1251,9 @@ async fn path_claims(
     refresh: bool,
     context: &ProviderContext<'_>,
     cache: &SnapshotCache,
-) -> Vec<ManagerClaims> {
+) -> (Vec<ManagerClaims>, Vec<String>) {
     let mut claims = Vec::new();
+    let mut failures = Vec::new();
     for manager in install_manager_registry() {
         let cell = cache
             .get(manager.id().as_str())
@@ -1172,6 +1263,12 @@ async fn path_claims(
             .and_then(Option::as_ref)
             .cloned()
             .unwrap_or_else(|| empty_snapshot(*manager));
+        if matches!(tool.id.as_str(), "rust" | "go") && manager.applies_to_path(tool) {
+            if let Some(failure) = snapshot_failure(*manager, &preliminary_snapshot) {
+                failures.push(failure);
+                continue;
+            }
+        }
         let preliminary = manager.claim(tool, &preliminary_snapshot);
         if preliminary.source.is_none() && preliminary.updater.is_none() {
             continue;
@@ -1188,10 +1285,19 @@ async fn path_claims(
                         },
                     )
                     .await
-                    .ok()
+                    .map(Some)
+                    .unwrap_or_else(|error| Some(failed_snapshot(*manager, error)))
             })
             .await;
-        claims.push(manager.claim(tool, snapshot.as_ref().unwrap_or(&empty_snapshot(*manager))));
+        let fallback = empty_snapshot(*manager);
+        let snapshot = snapshot.as_ref().unwrap_or(&fallback);
+        if matches!(tool.id.as_str(), "rust" | "go") {
+            if let Some(failure) = snapshot_failure(*manager, snapshot) {
+                failures.push(failure);
+                continue;
+            }
+        }
+        claims.push(manager.claim(tool, snapshot));
     }
     let path = std::fs::canonicalize(&tool.executable)
         .unwrap_or_else(|_| PathBuf::from(&tool.executable))
@@ -1217,7 +1323,7 @@ async fn path_claims(
             updater: None,
         });
     }
-    claims
+    (claims, failures)
 }
 
 async fn alternate_installations(
@@ -1357,7 +1463,8 @@ async fn report_tool(
         }
     };
 
-    let claims = resolve_claims(path_claims(&tool, refresh, context, &cache).await);
+    let (manager_claims, manager_failures) = path_claims(&tool, refresh, context, &cache).await;
+    let claims = resolve_claims(manager_claims);
     let diagnostics = if refresh {
         Diagnostics::default()
     } else {
@@ -1372,6 +1479,17 @@ async fn report_tool(
         source: claims.source.as_ref().map(|claim| claim.source.clone()),
         alternatives: alternate_installations(&tool, &cache, context).await,
     };
+    if !manager_failures.is_empty() {
+        return ToolReport {
+            id,
+            name,
+            status: ToolStatus::Failed,
+            detail: Some(manager_failures.join("; ")),
+            installation: Some(installation),
+            update: None,
+            diagnostics,
+        };
+    }
     let Some(updater_claim) = claims.updater else {
         return ToolReport {
             id,
