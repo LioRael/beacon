@@ -4,11 +4,21 @@ Beacon is a conservative macOS CLI for checking, upgrading, and diagnosing a dev
 
 ## Install
 
-Install the published crate with Cargo:
+Install the published crate with Cargo today:
 
 ```bash
 cargo install beacon-cli
 ```
+
+The repository also prepares these future distribution channels:
+
+```bash
+brew install LioRael/tap/beacon
+npm install --global @liorael/beacon
+```
+
+The `LioRael/homebrew-tap` repository and `@liorael/beacon` package have not been created or
+published yet. Do not rely on those commands until their first release is announced.
 
 You can also download the Apple Silicon archive from the
 [latest GitHub Release](https://github.com/liorael/beacon/releases/latest). Verify it before
@@ -57,4 +67,24 @@ Logs and history redact bearer/basic credentials, common secret assignments, and
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
+node --test packages/npm/test/*.test.mjs tests/*.test.mjs
 ```
+
+## Distribution setup
+
+Tag releases always build one Apple Silicon archive and publish it to GitHub Releases. The npm
+and Homebrew jobs reuse that archive and skip themselves until their credentials exist, so missing
+distribution credentials do not block the primary release.
+
+Before enabling the prepared channels:
+
+1. Create the public `LioRael/homebrew-tap` repository with a default branch and `Formula/`
+   directory.
+2. Confirm the npm account can publish the public `@liorael/beacon` package.
+3. Add an npm automation token as the `NPM_TOKEN` repository secret.
+4. Add a fine-grained token with write access to the tap repository as
+   `HOMEBREW_TAP_TOKEN`.
+
+The Rust crate, npm package, Git tag, GitHub Release, and generated Formula must use the same
+semantic version. The tag workflow stages the npm tarball and generates the Formula; it does not
+rebuild the native binary for either channel.

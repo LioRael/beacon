@@ -1,0 +1,37 @@
+{
+  "name": "@liorael/beacon",
+  "version": "0.1.0",
+  "description": "A conservative macOS development toolchain update manager",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/LioRael/beacon.git"
+  },
+  "homepage": "https://github.com/LioRael/beacon",
+  "type": "module",
+  "os": [
+    "darwin"
+  ],
+  "cpu": [
+    "arm64"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "bin": {
+    "beacon": "bin/beacon.mjs"
+  },
+  "files": [
+    "bin/beacon.mjs",
+    "vendor/beacon",
+    "LICENSE"
+  ],
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
+  "scripts": {
+    "test": "node --test test/*.test.mjs"
+  }
+}
+
