@@ -1,6 +1,9 @@
 use beacon::{
-    Manager, ToolStatus, command::CommandSpec, envelope::Envelope, orchestrator::run_until_failure,
-    redact::redact, versions::classify_manager,
+    ToolStatus,
+    command::CommandSpec,
+    envelope::{Envelope, ErrorDetail},
+    orchestrator::run_until_failure,
+    redact::redact,
 };
 
 #[test]
@@ -9,18 +12,6 @@ fn homebrew_upgrade_always_has_a_target() {
     let command = CommandSpec::brew_upgrade("wget").unwrap();
     assert_eq!(command.program, "brew");
     assert_eq!(command.args, ["upgrade", "wget"]);
-}
-
-#[test]
-fn manager_is_classified_from_active_executable_path() {
-    assert_eq!(
-        classify_manager("/opt/homebrew/bin/node"),
-        Manager::Homebrew
-    );
-    assert_eq!(
-        classify_manager("/Users/alice/.local/share/mise/installs/node/26/bin/node"),
-        Manager::Mise
-    );
 }
 
 #[test]
@@ -35,9 +26,22 @@ fn sensitive_output_is_redacted() {
 #[test]
 fn json_envelope_has_a_stable_schema() {
     let value = serde_json::to_value(Envelope::ok(vec![ToolStatus::Current])).unwrap();
-    assert_eq!(value["schema_version"], 1);
+    assert_eq!(value["schema_version"], 2);
     assert_eq!(value["status"], "ok");
     assert!(value["errors"].as_array().unwrap().is_empty());
+
+    let partial = Envelope::partial(
+        vec![ToolStatus::Current],
+        vec![ErrorDetail::new(
+            "manager_failed",
+            Some("manager:homebrew"),
+            "failed",
+        )],
+    );
+    let value = serde_json::to_value(partial).unwrap();
+    assert_eq!(value["status"], "partial");
+    assert_eq!(value["errors"][0]["code"], "manager_failed");
+    assert_eq!(value["errors"][0]["target"], "manager:homebrew");
 }
 
 #[tokio::test]

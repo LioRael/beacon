@@ -3,7 +3,7 @@ members = ["crates/beacon"]
 resolver = "2"
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 license = "MIT"
 rust-version = "1.85"
@@ -14,11 +14,15 @@ async-trait = "0.1"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
 dialoguer = "0.11"
+futures = "0.3"
 directories = "6"
+console = "0.15"
+indicatif = "0.18"
 rusqlite = { version = "0.37", features = ["bundled"] }
 semver = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tempfile = "3"
-tokio = { version = "1", features = ["macros", "process", "rt-multi-thread", "time"] }
+tokio = { version = "1", features = ["io-util", "macros", "process", "rt-multi-thread", "sync", "time"] }
 toml = "0.9"
+toml_edit = "0.23"

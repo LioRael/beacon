@@ -16,6 +16,17 @@ jobs:
         with:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
+      - run: node --test packages/npm/test/*.test.mjs tests/*.test.mjs
+      - name: Validate generated Homebrew Formula
+        run: |
+          node scripts/render-homebrew-formula.mjs \
+            0.1.0 \
+            aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+            /tmp/beacon.rb
+          ruby -c /tmp/beacon.rb
