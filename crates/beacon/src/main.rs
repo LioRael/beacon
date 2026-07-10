@@ -218,8 +218,14 @@ fn print_reports(data: &CheckData, ui: &Ui) {
                     "  {}",
                     ui.paint(
                         format!(
-                            "also detected: {} ({})",
+                            "also detected: {} {} ({})",
                             alternative.source,
+                            alternative
+                                .versions
+                                .iter()
+                                .map(|version| version.display())
+                                .collect::<Vec<_>>()
+                                .join(", "),
                             alternative.paths.join(", ")
                         ),
                         Style::new().dim()
@@ -232,8 +238,8 @@ fn print_reports(data: &CheckData, ui: &Ui) {
         }
         for conflict in &item.diagnostics.conflicts {
             println!(
-                "  conflict: {} {} ({:?})",
-                conflict.claim, conflict.id, conflict.confidence
+                "  conflict: {} {} ({:?}): {}",
+                conflict.claim, conflict.id, conflict.confidence, conflict.evidence
             );
         }
     }

@@ -188,6 +188,10 @@ async fn provider_orchestration_uses_fake_path_and_commands_end_to_end() {
     assert_eq!(installation.source.as_ref().unwrap().as_str(), "mise");
     assert_eq!(update.manager.as_str(), "npm");
     assert_eq!(update.latest.display(), "11.0.0");
+    assert_eq!(
+        update.action.command,
+        CommandSpec::new("npm", ["install", "--global", "npm@11.0.0"])
+    );
     let calls = executor.calls.lock().unwrap();
     assert!(calls.contains(&CommandSpec::new("/usr/bin/which", ["brew"])));
     assert!(calls.contains(&CommandSpec::new("/usr/bin/which", ["npm"])));
@@ -205,6 +209,28 @@ async fn provider_orchestration_uses_fake_path_and_commands_end_to_end() {
             .count(),
         1
     );
+}
+
+#[tokio::test]
+async fn missing_tool_never_queries_latest_or_builds_an_update() {
+    let executor = ProviderFakeExecutor::default();
+    let progress = RecordingProgress::default();
+    let context = ProviderContext::new(&executor, &progress, 9);
+    let config = Config {
+        enabled_tools: vec!["node".into()],
+        ..Config::default()
+    };
+
+    let reports = check_all_with_context(&config, true, &context)
+        .await
+        .unwrap();
+
+    assert_eq!(reports.tools[0].status, beacon::ToolStatus::Missing);
+    assert!(reports.tools[0].update.is_none());
+    assert!(executor.calls.lock().unwrap().iter().all(|call| {
+        !(call.program == "mise" && call.args.first().is_some_and(|arg| arg == "latest"))
+            && !(call.program == "npm" && call.args.first().is_some_and(|arg| arg == "view"))
+    }));
 }
 
 #[tokio::test]
@@ -395,6 +421,32 @@ fn path_linked_receipt_outranks_heuristics_and_selects_the_exact_brew_kind() {
         action.command,
         CommandSpec::new("brew", ["upgrade", "--formula", "node"])
     );
+}
+
+#[test]
+fn claim_evidence_redacts_the_home_directory() {
+    let manager = install_manager_registry()
+        .iter()
+        .find(|manager| manager.id().as_str() == "mise")
+        .unwrap();
+    let home = std::env::var("HOME").unwrap();
+    let tool = beacon::providers::DetectedTool {
+        id: ToolId::new("node").unwrap(),
+        executable: format!("{home}/.local/share/mise/installs/node/22/bin/node"),
+        version: ToolVersion::new("22.0.0", Some("22.0.0".into())).unwrap(),
+    };
+
+    let claims = manager.claim(
+        &tool,
+        &ManagerSnapshot {
+            manager: ManagerId::new("mise").unwrap(),
+            evidence: vec![],
+        },
+    );
+    let evidence = claims.source.unwrap().evidence;
+
+    assert!(evidence.contains("~/.local/share/mise/installs/node/22/bin/node"));
+    assert!(!evidence.contains(&home));
 }
 
 #[test]

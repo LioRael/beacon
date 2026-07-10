@@ -591,6 +591,27 @@ impl BuiltinInstallManager {
             ManagerKind::UvStandalone => tool.id.as_str() == "uv",
         }
     }
+
+    fn claim_evidence(
+        &self,
+        tool: &DetectedTool,
+        snapshot: &ManagerSnapshot,
+        receipt: bool,
+        role: &str,
+    ) -> String {
+        let basis = receipt
+            .then(|| {
+                snapshot
+                    .evidence
+                    .iter()
+                    .find(|evidence| self.receipt_matches(tool, evidence))
+                    .map(|evidence| format!("{}: {}", evidence.kind, evidence.value))
+            })
+            .flatten()
+            .unwrap_or_else(|| format!("active executable: {}", tool.executable));
+        let redacted = crate::redact::redact(&basis, std::env::var("HOME").ok().as_deref());
+        format!("{} {role} evidence: {redacted}", self.id)
+    }
 }
 
 #[async_trait]
@@ -762,7 +783,7 @@ impl InstallManager for BuiltinInstallManager {
                 })
                 .expect("valid source ID"),
                 confidence,
-                evidence: format!("{} evidence for active executable", self.id),
+                evidence: self.claim_evidence(tool, snapshot, receipt, "source"),
             });
         let project_managed = match self.kind {
             ManagerKind::Mise => [".mise.toml", ".tool-versions"].iter().any(|name| {
@@ -777,7 +798,7 @@ impl InstallManager for BuiltinInstallManager {
         let updater = (self.supports_update(tool) && !project_managed).then(|| UpdaterClaim {
             manager: self.id(),
             confidence,
-            evidence: format!("{} can update active executable", self.id),
+            evidence: self.claim_evidence(tool, snapshot, receipt, "updater"),
         });
         ManagerClaims { source, updater }
     }
