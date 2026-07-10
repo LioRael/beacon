@@ -22,10 +22,39 @@ test("skill keeps read-only checks automatic and upgrades confirmed", () => {
   assert.match(skill, /beacon history.*--json/);
   assert.match(skill, /explicit confirmation/i);
   assert.match(skill, /beacon upgrade <targets> --yes/);
-  assert.match(skill, /missing tools.*report/i);
+  assert.match(skill, /Report missing tools for diagnosis only/i);
   assert.match(skill, /schema_version: 2/);
   assert.match(skill, /data\.tools.*data\.inventories/i);
   assert.match(skill, /installation\.source.*update\.manager/i);
+});
+
+test("skill excludes missing and unmanaged from upgrade targets", () => {
+  assert.match(skill, /Never pass missing or unmanaged tools to `upgrade`/i);
+  assert.match(skill, /status is `outdated` and whose `action` is present/);
+});
+
+test("skill understands exact and floating verification modes", () => {
+  assert.match(skill, /`exact` or `floating` target mode/);
+  assert.match(skill, /`exact`:.*equal the confirmed expected version/i);
+  assert.match(skill, /`floating`:.*newer than the old version/i);
+  assert.match(skill, /no lower than the confirmed candidate/i);
+});
+
+test("skill interprets inspect envelope outcomes without scraping human terminal output", () => {
+  assert.match(skill, /Never scrape colored or human terminal/i);
+  assert.match(skill, /status: "ok"/);
+  assert.match(skill, /status: "partial"/);
+  assert.match(skill, /status: "error"/);
+  assert.match(skill, /exit 2/);
+  assert.match(skill, /exit 1/);
+});
+
+test("skill handles upgrade stop-on-first-failure via JSON status and recovery errors", () => {
+  assert.match(skill, /stops at the first failed command or verification/i);
+  assert.match(skill, /some targets succeeded.*status: "partial".*exit 2/is);
+  assert.match(skill, /no target succeeded.*status: "error".*exit 1/is);
+  assert.match(skill, /structured `errors` field/i);
+  assert.match(skill, /Do not scrape human terminal output or auto-retry/i);
 });
 
 test("skill excludes project dependencies and uses the agreed install order", () => {

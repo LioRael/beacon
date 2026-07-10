@@ -26,7 +26,9 @@ jobs:
       - name: Validate generated Homebrew Formula
         run: |
           node scripts/render-homebrew-formula.mjs \
-            0.1.0 \
+            0.2.0 \
             aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
             /tmp/beacon.rb
           ruby -c /tmp/beacon.rb
+      - name: Verify synchronized package versions
+        run: node scripts/verify-release-version.mjs v0.2.0
