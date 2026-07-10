@@ -4,14 +4,17 @@ use beacon::{
     command::CommandSpec,
     config::Config,
     providers::{
-        ClaimConfidence, CommandExecutor, ManagerClaims, ManagerEvidence, ManagerId,
-        ManagerSnapshot, ProgressSink, ProviderContext, RefreshPolicy, SourceClaim, SourceId,
-        TargetMode, ToolId, ToolVersion, UpdaterClaim, UpgradeAction, check_all_with_context,
-        install_manager_registry, resolve_claims, tool_registry, verify_versions,
+        ClaimConfidence, CommandExecutor, MAX_INDEPENDENT_DETECTION_CONCURRENCY, ManagerClaims,
+        ManagerEvidence, ManagerId, ManagerSnapshot, ProgressSink, ProviderContext, RefreshPolicy,
+        SourceClaim, SourceId, TargetMode, ToolId, ToolVersion, UpdaterClaim, UpgradeAction,
+        check_all_with_context, install_manager_registry, resolve_claims, tool_registry,
+        verify_versions,
     },
     runner::CommandOutput,
 };
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
 #[derive(Default)]
 struct FakeExecutor {
@@ -895,4 +898,444 @@ async fn rustup_query_failure_is_reported_as_failed_instead_of_unmanaged() {
             .unwrap()
             .contains("manager query failed")
     );
+}
+
+/// Tracks how many independent tool version reads run at once.
+struct ConcurrencyProbeExecutor {
+    active: AtomicUsize,
+    max_active: AtomicUsize,
+    version_reads: AtomicUsize,
+}
+
+impl Default for ConcurrencyProbeExecutor {
+    fn default() -> Self {
+        Self {
+            active: AtomicUsize::new(0),
+            max_active: AtomicUsize::new(0),
+            version_reads: AtomicUsize::new(0),
+        }
+    }
+}
+
+impl ConcurrencyProbeExecutor {
+    fn is_tool_version_read(command: &CommandSpec) -> bool {
+        let path = command.program.as_str();
+        let version_args = command.args == ["--version"] || command.args == ["version"];
+        version_args
+            && (path.ends_with("/node")
+                || path.ends_with("/npm")
+                || path.ends_with("/pnpm")
+                || path.ends_with("/bun")
+                || path.ends_with("/deno")
+                || path.ends_with("/uv")
+                || path.ends_with("/rustc")
+                || path.ends_with("/go"))
+    }
+}
+
+#[async_trait]
+impl CommandExecutor for ConcurrencyProbeExecutor {
+    async fn execute(&self, command: &CommandSpec, _timeout_seconds: u64) -> Result<CommandOutput> {
+        let is_version = Self::is_tool_version_read(command);
+        if is_version {
+            let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_active.fetch_max(active, Ordering::SeqCst);
+            self.version_reads.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            self.active.fetch_sub(1, Ordering::SeqCst);
+        }
+
+        let stdout = match (command.program.as_str(), command.args.as_slice()) {
+            ("/usr/bin/which", args) if args.len() == 1 => {
+                format!("/fixture/bin/{}\n", args[0])
+            }
+            (path, args) if path.starts_with("/fixture/bin/") && args == ["--version"] => {
+                match path {
+                    "/fixture/bin/node" => "v20.0.0\n".into(),
+                    "/fixture/bin/npm" => "10.0.0\n".into(),
+                    "/fixture/bin/pnpm" => "9.0.0\n".into(),
+                    "/fixture/bin/bun" => "1.1.0\n".into(),
+                    "/fixture/bin/deno" => "deno 1.40.0 (release, aarch64-apple-darwin)\n".into(),
+                    "/fixture/bin/uv" => "uv 0.6.0\n".into(),
+                    "/fixture/bin/rustc" => "rustc 1.80.0 (fixture)\n".into(),
+                    _ => "0.0.0\n".into(),
+                }
+            }
+            ("/fixture/bin/go", args) if args == ["version"] => {
+                "go version go1.22.0 darwin/arm64\n".into()
+            }
+            ("mise", args) if args == ["ls", "--json"] => "{}\n".into(),
+            ("npm", args) if args == ["prefix", "--global"] => "/fixture/npm-global\n".into(),
+            ("corepack", args) if args == ["--version"] => "0.24.0\n".into(),
+            ("rustup", args) if args == ["show", "active-toolchain"] => {
+                "stable-aarch64-apple-darwin (default)\n".into()
+            }
+            ("bun", args) if args == ["--version"] => "1.1.0\n".into(),
+            ("deno", args) if args == ["--version"] => {
+                "deno 1.40.0 (release, aarch64-apple-darwin)\n".into()
+            }
+            ("uv", args) if args == ["self", "update", "--dry-run"] => {
+                "uv is already at the latest version 0.6.0\n".into()
+            }
+            ("npm", args) if args.first().map(String::as_str) == Some("view") => "11.0.0\n".into(),
+            ("mise", args) if args.first().map(String::as_str) == Some("latest") => {
+                "1.0.1\n".into()
+            }
+            ("rustup", args) if args == ["check"] => {
+                "stable-aarch64-apple-darwin - Up to date : 1.80.0\n".into()
+            }
+            ("curl", _) => r#"{"tag_name":"bun-v1.1.0"}"#.into(),
+            ("deno", args) if args.first().map(String::as_str) == Some("upgrade") => {
+                "Current version: 1.40.0\nLatest version: 1.40.0\n".into()
+            }
+            _ => anyhow::bail!("unexpected command: {} {:?}", command.program, command.args),
+        };
+        Ok(CommandOutput {
+            stdout,
+            stderr: String::new(),
+        })
+    }
+}
+
+#[tokio::test]
+async fn independent_tool_detection_never_exceeds_max_concurrency() {
+    let executor = ConcurrencyProbeExecutor::default();
+    let progress = RecordingProgress::default();
+    let context = ProviderContext::new(&executor, &progress, 9);
+    let config = Config {
+        enabled_tools: tool_registry()
+            .iter()
+            .map(|adapter| adapter.id().to_string())
+            .collect(),
+        enabled_inventories: vec![],
+        ..Config::default()
+    };
+
+    let _reports = check_all_with_context(&config, false, &context)
+        .await
+        .unwrap();
+
+    let max = executor.max_active.load(Ordering::SeqCst);
+    let reads = executor.version_reads.load(Ordering::SeqCst);
+    assert!(
+        reads >= MAX_INDEPENDENT_DETECTION_CONCURRENCY,
+        "expected enough concurrent version reads to exercise the bound, got {reads}"
+    );
+    assert!(
+        max <= MAX_INDEPENDENT_DETECTION_CONCURRENCY,
+        "independent detection concurrency {max} exceeded bound {}",
+        MAX_INDEPENDENT_DETECTION_CONCURRENCY
+    );
+    assert_eq!(MAX_INDEPENDENT_DETECTION_CONCURRENCY, 4);
+}
+
+/// Completes tools in reverse registry order so order is not completion-order by accident.
+struct ReverseCompletionExecutor {
+    calls: Mutex<Vec<CommandSpec>>,
+}
+
+impl Default for ReverseCompletionExecutor {
+    fn default() -> Self {
+        Self {
+            calls: Mutex::new(Vec::new()),
+        }
+    }
+}
+
+#[async_trait]
+impl CommandExecutor for ReverseCompletionExecutor {
+    async fn execute(&self, command: &CommandSpec, _timeout_seconds: u64) -> Result<CommandOutput> {
+        self.calls.lock().unwrap().push(command.clone());
+        let is_version_read = command.args == ["--version"] || command.args == ["version"];
+        if is_version_read {
+            let delay_ms = if command.program.ends_with("/node") {
+                5
+            } else if command.program.ends_with("/go") {
+                1
+            } else if command.program.ends_with("/npm") {
+                3
+            } else {
+                2
+            };
+            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+        }
+
+        let stdout = match (command.program.as_str(), command.args.as_slice()) {
+            ("/usr/bin/which", args) if args.len() == 1 => {
+                format!("/fixture/bin/{}\n", args[0])
+            }
+            ("/fixture/bin/node", args) if args == ["--version"] => "v20.0.0\n".into(),
+            ("/fixture/bin/npm", args) if args == ["--version"] => "10.0.0\n".into(),
+            ("/fixture/bin/go", args) if args == ["version"] => {
+                "go version go1.22.0 darwin/arm64\n".into()
+            }
+            ("mise", args) if args == ["ls", "--json"] => {
+                r#"{"node":[{"version":"20","requested_version":"20","install_path":"/fixture/bin"}],"go":[{"version":"1.22","requested_version":"1.22","install_path":"/fixture/bin"}]}"#.into()
+            }
+            ("mise", args) if args.first().map(String::as_str) == Some("latest") => {
+                match args.get(1).map(String::as_str) {
+                    Some("node@20") => "20.1.0\n".into(),
+                    Some("go@1.22") => "1.22.1\n".into(),
+                    _ => "1.0.1\n".into(),
+                }
+            }
+            ("npm", args) if args == ["prefix", "--global"] => "/fixture/npm-global\n".into(),
+            ("npm", args) if args == ["view", "npm", "version"] => "11.0.0\n".into(),
+            _ => anyhow::bail!("unexpected command: {} {:?}", command.program, command.args),
+        };
+        Ok(CommandOutput {
+            stdout,
+            stderr: String::new(),
+        })
+    }
+}
+
+#[tokio::test]
+async fn tool_reports_preserve_compile_time_registry_order() {
+    let executor = ReverseCompletionExecutor::default();
+    let progress = RecordingProgress::default();
+    let context = ProviderContext::new(&executor, &progress, 9);
+    let config = Config {
+        enabled_tools: vec!["go".into(), "node".into(), "npm".into()],
+        enabled_inventories: vec![],
+        ..Config::default()
+    };
+
+    let reports = check_all_with_context(&config, false, &context)
+        .await
+        .unwrap();
+
+    let ids = reports
+        .tools
+        .iter()
+        .map(|report| report.id.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(ids, ["node", "npm", "go"]);
+}
+
+struct RefreshPolicyExecutor {
+    calls: Mutex<Vec<CommandSpec>>,
+}
+
+impl Default for RefreshPolicyExecutor {
+    fn default() -> Self {
+        Self {
+            calls: Mutex::new(Vec::new()),
+        }
+    }
+}
+
+#[async_trait]
+impl CommandExecutor for RefreshPolicyExecutor {
+    async fn execute(&self, command: &CommandSpec, _timeout_seconds: u64) -> Result<CommandOutput> {
+        self.calls.lock().unwrap().push(command.clone());
+        let stdout = match (command.program.as_str(), command.args.as_slice()) {
+            ("/usr/bin/which", args) if args == ["brew"] => "/fixture/bin/brew\n",
+            ("/usr/bin/which", _) => anyhow::bail!("not on path"),
+            ("brew", args) if args == ["update"] => "",
+            ("brew", args) if args == ["list", "--formula", "--versions"] => "wget 1.21.4\n",
+            ("brew", args) if args == ["list", "--cask", "--versions"] => "firefox 120.0\n",
+            ("brew", args) if args == ["--prefix"] => "/opt/homebrew\n",
+            ("brew", args) if args == ["outdated", "--json=v2"] => {
+                r#"{"formulae":[{"name":"zlib","installed_versions":["1.2"],"current_version":"1.3"},{"name":"wget","installed_versions":["1.21.3"],"current_version":"1.21.4"}],"casks":[{"name":"firefox","installed_versions":["119.0"],"current_version":"120.0"}]}"#
+            }
+            _ => anyhow::bail!("unexpected command: {} {:?}", command.program, command.args),
+        };
+        Ok(CommandOutput {
+            stdout: stdout.into(),
+            stderr: String::new(),
+        })
+    }
+}
+
+#[tokio::test]
+async fn check_refresh_runs_brew_update_while_doctor_uses_cached_reads() {
+    let progress = RecordingProgress::default();
+
+    let refresh_executor = RefreshPolicyExecutor::default();
+    let refresh_context = ProviderContext::new(&refresh_executor, &progress, 9);
+    let config = Config {
+        enabled_tools: vec![],
+        enabled_inventories: vec!["homebrew".into()],
+        ..Config::default()
+    };
+    let _ = check_all_with_context(&config, true, &refresh_context)
+        .await
+        .unwrap();
+    let refresh_calls = refresh_executor.calls.lock().unwrap().clone();
+    assert!(
+        refresh_calls
+            .iter()
+            .any(|call| *call == CommandSpec::new("brew", ["update"])),
+        "check/upgrade preparation must force manager refresh"
+    );
+
+    let cached_executor = RefreshPolicyExecutor::default();
+    let cached_context = ProviderContext::new(&cached_executor, &progress, 9);
+    let _ = check_all_with_context(&config, false, &cached_context)
+        .await
+        .unwrap();
+    let cached_calls = cached_executor.calls.lock().unwrap().clone();
+    assert!(
+        cached_calls
+            .iter()
+            .all(|call| *call != CommandSpec::new("brew", ["update"])),
+        "doctor must avoid state-mutating refresh"
+    );
+    assert!(
+        cached_calls
+            .iter()
+            .any(|call| *call == CommandSpec::new("brew", ["list", "--formula", "--versions"])),
+        "doctor may still perform read-only manager queries"
+    );
+}
+
+#[tokio::test]
+async fn inventory_items_use_stable_sorted_order() {
+    let executor = RefreshPolicyExecutor::default();
+    let progress = RecordingProgress::default();
+    let context = ProviderContext::new(&executor, &progress, 9);
+    let config = Config {
+        enabled_tools: vec![],
+        enabled_inventories: vec!["homebrew".into()],
+        ..Config::default()
+    };
+
+    let reports = check_all_with_context(&config, false, &context)
+        .await
+        .unwrap();
+    let ids = reports
+        .inventories
+        .iter()
+        .map(|item| item.id.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        ids,
+        [
+            "brew:cask:firefox",
+            "brew:formula:wget",
+            "brew:formula:zlib",
+        ]
+    );
+}
+
+struct IsolationExecutor {
+    calls: Mutex<Vec<CommandSpec>>,
+}
+
+impl Default for IsolationExecutor {
+    fn default() -> Self {
+        Self {
+            calls: Mutex::new(Vec::new()),
+        }
+    }
+}
+
+#[async_trait]
+impl CommandExecutor for IsolationExecutor {
+    async fn execute(&self, command: &CommandSpec, _timeout_seconds: u64) -> Result<CommandOutput> {
+        self.calls.lock().unwrap().push(command.clone());
+        let stdout = match (command.program.as_str(), command.args.as_slice()) {
+            ("/usr/bin/which", args) if args == ["node"] => {
+                "/fixture/mise/installs/node/20/bin/node\n"
+            }
+            ("/usr/bin/which", args) if args == ["rustc"] => "/Users/alice/.cargo/bin/rustc\n",
+            ("/usr/bin/which", args) if args == ["mise"] => "/fixture/bin/mise\n",
+            ("/usr/bin/which", args) if args == ["rustup"] => "/fixture/bin/rustup\n",
+            ("/usr/bin/which", _) => anyhow::bail!("not on path"),
+            ("/fixture/mise/installs/node/20/bin/node", args) if args == ["--version"] => {
+                "v20.0.0\n"
+            }
+            ("/Users/alice/.cargo/bin/rustc", args) if args == ["--version"] => {
+                "rustc 1.80.0 (fixture)\n"
+            }
+            ("mise", args) if args == ["ls", "--json"] => {
+                r#"{"node":[{"version":"20","requested_version":"20","install_path":"/fixture/mise/installs/node/20"}]}"#
+            }
+            ("mise", args) if args == ["latest", "node@20"] => "20.1.0\n",
+            ("rustup", args) if args == ["show", "active-toolchain"] => {
+                anyhow::bail!("rustup state unavailable")
+            }
+            _ => anyhow::bail!("unexpected command: {} {:?}", command.program, command.args),
+        };
+        Ok(CommandOutput {
+            stdout: stdout.into(),
+            stderr: String::new(),
+        })
+    }
+}
+
+#[tokio::test]
+async fn manager_failure_only_affects_dependent_tool_reports() {
+    let executor = IsolationExecutor::default();
+    let progress = RecordingProgress::default();
+    let context = ProviderContext::new(&executor, &progress, 9);
+    let config = Config {
+        enabled_tools: vec!["rust".into(), "node".into()],
+        enabled_inventories: vec![],
+        ..Config::default()
+    };
+
+    let reports = check_all_with_context(&config, false, &context)
+        .await
+        .unwrap();
+
+    assert_eq!(reports.tools.len(), 2);
+    let rust = reports
+        .tools
+        .iter()
+        .find(|report| report.id == "rust")
+        .unwrap();
+    let node = reports
+        .tools
+        .iter()
+        .find(|report| report.id == "node")
+        .unwrap();
+
+    assert_eq!(rust.status, beacon::ToolStatus::Failed);
+    assert!(rust.update.is_none());
+    assert!(
+        rust.detail
+            .as_deref()
+            .unwrap_or_default()
+            .contains("manager query failed")
+    );
+
+    assert_ne!(node.status, beacon::ToolStatus::Failed);
+    assert_eq!(
+        node.installation
+            .as_ref()
+            .unwrap()
+            .source
+            .as_ref()
+            .unwrap()
+            .as_str(),
+        "mise"
+    );
+    assert!(node.update.is_some());
+}
+
+#[tokio::test]
+async fn shared_manager_snapshot_is_created_at_most_once_per_operation() {
+    let executor = SharedMiseExecutor::default();
+    let progress = RecordingProgress::default();
+    let context = ProviderContext::new(&executor, &progress, 9);
+    let config = Config {
+        enabled_tools: vec!["node".into(), "go".into()],
+        enabled_inventories: vec![],
+        ..Config::default()
+    };
+
+    let _ = check_all_with_context(&config, true, &context)
+        .await
+        .unwrap();
+
+    let snapshot_calls = executor
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|call| **call == CommandSpec::new("mise", ["ls", "--json"]))
+        .count();
+    assert_eq!(snapshot_calls, 1);
 }

@@ -1253,6 +1253,9 @@ fn manager_executable(manager: &dyn InstallManager) -> &'static str {
     }
 }
 
+/// Maximum number of independent tool detections that may run at once.
+pub const MAX_INDEPENDENT_DETECTION_CONCURRENCY: usize = 4;
+
 async fn prefetch_snapshots(refresh: bool, context: &ProviderContext<'_>, cache: &SnapshotCache) {
     stream::iter(install_manager_registry().iter().copied().map(|manager| {
         let cache = cache.clone();
@@ -1287,7 +1290,7 @@ async fn prefetch_snapshots(refresh: bool, context: &ProviderContext<'_>, cache:
             .await;
         }
     }))
-    .buffered(4)
+    .buffered(MAX_INDEPENDENT_DETECTION_CONCURRENCY)
     .collect::<Vec<_>>()
     .await;
 }
@@ -1309,11 +1312,19 @@ async fn path_claims(
             .and_then(Option::as_ref)
             .cloned()
             .unwrap_or_else(|| empty_snapshot(*manager));
-        if matches!(tool.id.as_str(), "rust" | "go") && manager.applies_to_path(tool) {
-            if let Some(failure) = snapshot_failure(*manager, &preliminary_snapshot) {
-                failures.push(failure);
+        // A failed snapshot only poisons tools that cannot form a claim without it
+        // (for example rustup receipts). Path-heuristic claims still proceed so
+        // unrelated or partially dependent tools keep reporting.
+        if let Some(failure) = snapshot_failure(*manager, &preliminary_snapshot) {
+            let claim = manager.claim(tool, &preliminary_snapshot);
+            if claim.source.is_none() && claim.updater.is_none() {
+                if manager.applies_to_path(tool) {
+                    failures.push(failure);
+                }
                 continue;
             }
+            claims.push(claim);
+            continue;
         }
         let preliminary = manager.claim(tool, &preliminary_snapshot);
         if preliminary.source.is_none() && preliminary.updater.is_none() {
@@ -1337,13 +1348,14 @@ async fn path_claims(
             .await;
         let fallback = empty_snapshot(*manager);
         let snapshot = snapshot.as_ref().unwrap_or(&fallback);
-        if matches!(tool.id.as_str(), "rust" | "go") {
-            if let Some(failure) = snapshot_failure(*manager, snapshot) {
+        let claim = manager.claim(tool, snapshot);
+        if let Some(failure) = snapshot_failure(*manager, snapshot) {
+            if claim.source.is_none() && claim.updater.is_none() {
                 failures.push(failure);
                 continue;
             }
         }
-        claims.push(manager.claim(tool, snapshot));
+        claims.push(claim);
     }
     let path = std::fs::canonicalize(&tool.executable)
         .unwrap_or_else(|_| PathBuf::from(&tool.executable))
@@ -1791,9 +1803,10 @@ pub async fn check_all_with_context(
             .into_iter()
             .map(|adapter| report_tool(adapter, refresh, context, cache.clone())),
     )
-    .buffered(4)
+    .buffered(MAX_INDEPENDENT_DETECTION_CONCURRENCY)
     .collect::<Vec<_>>()
     .await;
+    // Preserve compile-time registry order regardless of task completion order.
     tools.sort_by_key(|report| {
         tool_registry()
             .iter()
