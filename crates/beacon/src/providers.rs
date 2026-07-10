@@ -934,7 +934,7 @@ impl InstallManager for BuiltinInstallManager {
                     serde_json::from_str(&output.stdout).context("invalid Bun release response")?;
                 value["tag_name"]
                     .as_str()
-                    .and_then(version_number)
+                    .and_then(|tag| version_number(tag.trim_start_matches("bun-")))
                     .context("Bun release response had no version")?
             }
             _ => version_number(&output.stdout).context("latest output had no version")?,
