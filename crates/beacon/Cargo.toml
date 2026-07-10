@@ -28,6 +28,7 @@ async-trait.workspace = true
 chrono.workspace = true
 clap.workspace = true
 dialoguer.workspace = true
+futures.workspace = true
 directories.workspace = true
 console.workspace = true
 indicatif.workspace = true
@@ -37,6 +38,7 @@ serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 toml.workspace = true
+toml_edit.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

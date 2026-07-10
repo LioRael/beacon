@@ -50,10 +50,10 @@ test("Rust and npm package versions stay synchronized", () => {
 
 test("release tags must match Rust and npm package versions", () => {
   assert.doesNotThrow(() =>
-    verifyReleaseVersion({ tag: "v0.1.0", cargoVersion: "0.1.0", npmVersion: "0.1.0" }),
+    verifyReleaseVersion({ tag: "v0.2.0", cargoVersion: "0.2.0", npmVersion: "0.2.0" }),
   );
   assert.throws(
-    () => verifyReleaseVersion({ tag: "v0.2.0", cargoVersion: "0.1.0", npmVersion: "0.1.0" }),
+    () => verifyReleaseVersion({ tag: "v0.3.0", cargoVersion: "0.2.0", npmVersion: "0.2.0" }),
     /does not match/,
   );
 });

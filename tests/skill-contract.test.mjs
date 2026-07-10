@@ -11,7 +11,7 @@ const metadata = fs.readFileSync(
 test("skill metadata is complete and discoverable", () => {
   assert.doesNotMatch(skill, /TODO/);
   assert.match(skill, /^name: beacon$/m);
-  assert.match(skill, /Homebrew.*Rust.*Node.*npm.*pnpm.*Go/i);
+  assert.match(skill, /Homebrew.*Rust.*Node.*npm.*pnpm.*Go.*Bun.*Deno.*uv/i);
   assert.match(metadata, /display_name: "Beacon"/);
   assert.match(metadata, /default_prompt: "[^"]*\$beacon[^"]*"/);
 });
@@ -23,6 +23,9 @@ test("skill keeps read-only checks automatic and upgrades confirmed", () => {
   assert.match(skill, /explicit confirmation/i);
   assert.match(skill, /beacon upgrade <targets> --yes/);
   assert.match(skill, /missing tools.*report/i);
+  assert.match(skill, /schema_version: 2/);
+  assert.match(skill, /data\.tools.*data\.inventories/i);
+  assert.match(skill, /installation\.source.*update\.manager/i);
 });
 
 test("skill excludes project dependencies and uses the agreed install order", () => {
@@ -33,4 +36,3 @@ test("skill excludes project dependencies and uses the agreed install order", ()
 
   assert.ok(homebrew >= 0 && homebrew < npm && npm < cargo);
 });
-

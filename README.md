@@ -1,6 +1,6 @@
-# Beacon
+# Beacon 0.2
 
-Beacon is a conservative macOS CLI for checking, upgrading, and diagnosing a development toolchain. It manages only the executable currently active on `PATH`, reports duplicate mise installations, previews every command, and never performs an untargeted `brew upgrade`.
+Beacon is a conservative macOS CLI for checking, upgrading, and diagnosing a development toolchain. It manages only the executable currently active on `PATH`, keeps installation source separate from update manager, previews every command, and never performs an untargeted `brew upgrade`.
 
 ## Install
 
@@ -25,20 +25,19 @@ You can also download the Apple Silicon archive from the
 installing:
 
 ```bash
-shasum -a 256 -c beacon-v0.1.0-aarch64-apple-darwin.tar.gz.sha256
-tar -xzf beacon-v0.1.0-aarch64-apple-darwin.tar.gz
-install -m 755 beacon-v0.1.0-aarch64-apple-darwin/beacon /usr/local/bin/beacon
+shasum -a 256 -c beacon-v0.2.0-aarch64-apple-darwin.tar.gz.sha256
+tar -xzf beacon-v0.2.0-aarch64-apple-darwin.tar.gz
+install -m 755 beacon-v0.2.0-aarch64-apple-darwin/beacon /usr/local/bin/beacon
 ```
 
 Prebuilt binaries require Apple Silicon and macOS 15 Sequoia or newer. Installing from Cargo
-requires Rust 1.85 or newer. Beacon v0.1 manages Homebrew formulae/casks, rustup toolchains,
-Node.js, npm, pnpm, and Go.
+requires Rust 1.85 or newer. Beacon v0.2 covers Rust, Node.js, npm, pnpm, Go, Bun, Deno, and uv. Homebrew formulae and casks are reported as a separate inventory.
 
 ## Commands
 
 ```bash
 beacon check                    # refresh remote metadata with progress feedback
-beacon check --json             # stable schema_version: 1 output
+beacon check --json             # stable schema_version: 2 output
 beacon upgrade                  # interactively select and confirm updates
 beacon upgrade npm --yes        # explicit non-interactive update
 beacon --verbose upgrade npm     # stream the underlying command output
@@ -49,7 +48,9 @@ beacon config show
 beacon config set command_timeout_seconds 180
 ```
 
-`upgrade` lists only installed, outdated tools. Missing tools remain visible in `check` and `doctor`, but Beacon does not install them through `upgrade`. An upgrade stops on the first command or verification failure and prints manager-specific recovery guidance.
+`upgrade` lists only installed, outdated tools and qualified Homebrew inventory targets. Missing and unmanaged tools remain visible in `check` and `doctor`, but Beacon does not install them through `upgrade`. An upgrade stops on the first command or verification failure and prints manager-specific recovery guidance.
+
+Machine output always uses a schema v2 envelope with `tools` and `inventories` arrays. Tool `installation` and `update` sections are independently nullable. A successful partial check returns valid JSON and exit code 2 with structured, redacted errors; fatal failures return exit code 1.
 
 Interactive terminals use color and a spinner with the current stage and elapsed time. Redirected human output uses plain stage lines, while `--json` keeps stdout machine-readable and suppresses progress. Set `NO_COLOR` or pass `--no-color` to disable ANSI styling. Verbose child-process output is streamed to stderr after Beacon redacts common credentials and the absolute home directory.
 

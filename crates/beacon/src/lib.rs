@@ -45,28 +45,58 @@ pub mod command {
 }
 
 pub mod envelope {
-    use serde::Serialize;
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct ErrorDetail {
+        pub code: String,
+        pub target: Option<String>,
+        pub message: String,
+    }
+
+    impl ErrorDetail {
+        pub fn new(
+            code: impl Into<String>,
+            target: Option<impl Into<String>>,
+            message: impl Into<String>,
+        ) -> Self {
+            Self {
+                code: code.into(),
+                target: target.map(Into::into),
+                message: message.into(),
+            }
+        }
+    }
 
     #[derive(Debug, Serialize)]
     pub struct Envelope<T: Serialize> {
         pub schema_version: u8,
         pub status: &'static str,
         pub data: T,
-        pub errors: Vec<String>,
+        pub errors: Vec<ErrorDetail>,
     }
 
     impl<T: Serialize> Envelope<T> {
         pub fn ok(data: T) -> Self {
             Self {
-                schema_version: 1,
+                schema_version: 2,
                 status: "ok",
                 data,
                 errors: vec![],
             }
         }
-        pub fn error(data: T, errors: Vec<String>) -> Self {
+        pub fn partial(data: T, errors: Vec<ErrorDetail>) -> Self {
             Self {
-                schema_version: 1,
+                schema_version: 2,
+                status: "partial",
+                data,
+                errors,
+            }
+        }
+
+        pub fn error(data: T, errors: Vec<ErrorDetail>) -> Self {
+            Self {
+                schema_version: 2,
                 status: "error",
                 data,
                 errors,
@@ -121,21 +151,6 @@ pub mod redact {
 }
 
 pub mod versions {
-    use crate::Manager;
-    use std::path::Path;
-
-    pub fn classify_manager(path: &str) -> Manager {
-        if path.contains("/mise/") {
-            Manager::Mise
-        } else if path.contains("/homebrew/") {
-            Manager::Homebrew
-        } else if path.contains("/.cargo/") {
-            Manager::Rustup
-        } else {
-            Manager::Unknown
-        }
-    }
-
     pub fn version_number(output: &str) -> Option<String> {
         output.split_whitespace().find_map(|word| {
             let trimmed = word
@@ -148,11 +163,6 @@ pub mod versions {
             (trimmed.chars().next()?.is_ascii_digit() && trimmed.contains('.'))
                 .then(|| trimmed.to_string())
         })
-    }
-
-    pub fn manager_for_executable(path: &Path) -> Manager {
-        let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-        classify_manager(&resolved.to_string_lossy())
     }
 }
 
@@ -180,7 +190,7 @@ pub mod upgrade {
     pub fn upgrade_candidates(reports: &[ToolReport]) -> Vec<ToolReport> {
         reports
             .iter()
-            .filter(|report| report.status == ToolStatus::Outdated && report.action.is_some())
+            .filter(|report| report.status == ToolStatus::Outdated && report.update.is_some())
             .cloned()
             .collect()
     }
@@ -255,7 +265,7 @@ pub mod ui {
         let style = match status {
             ToolStatus::Current => Style::new().green(),
             ToolStatus::Outdated => Style::new().yellow(),
-            ToolStatus::Missing | ToolStatus::Unavailable => Style::new().yellow(),
+            ToolStatus::Missing | ToolStatus::Unmanaged => Style::new().yellow(),
             ToolStatus::Failed => Style::new().red(),
         };
         if colors {
@@ -268,7 +278,13 @@ pub mod ui {
     pub struct Ui {
         mode: FeedbackMode,
         colors: bool,
-        progress: Mutex<Option<ProgressBar>>,
+        progress: Mutex<ProgressState>,
+    }
+
+    #[derive(Default)]
+    struct ProgressState {
+        active: usize,
+        bar: Option<ProgressBar>,
     }
 
     impl Ui {
@@ -278,7 +294,7 @@ pub mod ui {
             Self {
                 mode: FeedbackMode::select(is_tty, json, verbose),
                 colors,
-                progress: Mutex::new(None),
+                progress: Mutex::new(ProgressState::default()),
             }
         }
 
@@ -300,6 +316,12 @@ pub mod ui {
         pub(crate) fn start_progress(&self, label: &str) {
             match self.mode {
                 FeedbackMode::Spinner => {
+                    let mut progress = self.progress.lock().expect("progress mutex poisoned");
+                    progress.active += 1;
+                    if let Some(bar) = &progress.bar {
+                        bar.set_message(label.to_string());
+                        return;
+                    }
                     let bar = ProgressBar::with_draw_target(None, ProgressDrawTarget::stderr());
                     if let Ok(style) = ProgressStyle::with_template(spinner_template(self.colors)) {
                         bar.set_style(
@@ -308,7 +330,7 @@ pub mod ui {
                     }
                     bar.set_message(label.to_string());
                     bar.enable_steady_tick(Duration::from_millis(80));
-                    *self.progress.lock().expect("progress mutex poisoned") = Some(bar);
+                    progress.bar = Some(bar);
                 }
                 FeedbackMode::Plain => eprintln!("… {label}"),
                 FeedbackMode::Silent | FeedbackMode::Verbose => {}
@@ -316,13 +338,12 @@ pub mod ui {
         }
 
         pub(crate) fn finish_progress(&self) {
-            if let Some(bar) = self
-                .progress
-                .lock()
-                .expect("progress mutex poisoned")
-                .take()
-            {
-                bar.finish_and_clear();
+            let mut progress = self.progress.lock().expect("progress mutex poisoned");
+            progress.active = progress.active.saturating_sub(1);
+            if progress.active == 0 {
+                if let Some(bar) = progress.bar.take() {
+                    bar.finish_and_clear();
+                }
             }
         }
 
@@ -344,46 +365,73 @@ pub mod ui {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum Manager {
-    Homebrew,
-    Rustup,
-    Mise,
-    Npm,
-    Unknown,
-}
-
-impl std::fmt::Display for Manager {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", format!("{self:?}").to_lowercase())
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
 pub enum ToolStatus {
     Current,
     Outdated,
     Missing,
-    Unavailable,
+    Unmanaged,
     Failed,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AlternativeInstallation {
+    pub source: providers::SourceId,
+    pub versions: Vec<providers::ToolVersion>,
+    pub paths: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InstallationReport {
+    pub current: providers::ToolVersion,
+    pub executable: String,
+    pub source: Option<providers::SourceId>,
+    pub alternatives: Vec<AlternativeInstallation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpdateReport {
+    pub manager: providers::ManagerId,
+    pub latest: providers::ToolVersion,
+    pub action: providers::UpgradeAction,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Diagnostics {
+    pub evidence: Vec<providers::ClaimEvidence>,
+    pub conflicts: Vec<providers::ClaimEvidence>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolReport {
     pub id: String,
     pub name: String,
-    pub current: Option<String>,
-    pub latest: Option<String>,
     pub status: ToolStatus,
-    pub manager: Manager,
-    pub executable: Option<String>,
-    pub other_sources: Vec<String>,
     pub detail: Option<String>,
-    pub action: Option<command::CommandSpec>,
+    pub installation: Option<InstallationReport>,
+    pub update: Option<UpdateReport>,
+    pub diagnostics: Diagnostics,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InventoryReport {
+    pub id: String,
+    pub name: String,
+    pub kind: String,
+    pub status: ToolStatus,
+    pub current: Option<providers::ToolVersion>,
+    pub latest: Option<providers::ToolVersion>,
+    pub action: Option<providers::UpgradeAction>,
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckData {
+    pub tools: Vec<ToolReport>,
+    pub inventories: Vec<InventoryReport>,
 }
 
 pub mod config {
-    use anyhow::{Context, Result};
+    use anyhow::{Context, Result, bail};
     use directories::ProjectDirs;
     use serde::{Deserialize, Serialize};
     use std::{
@@ -394,26 +442,30 @@ pub mod config {
     #[derive(Debug, Clone, Serialize, Deserialize)]
     #[serde(default)]
     pub struct Config {
+        pub schema_version: u8,
         pub enabled_tools: Vec<String>,
+        pub enabled_inventories: Vec<String>,
         pub history_limit: usize,
         pub command_timeout_seconds: u64,
-        pub preferred_install_manager: String,
     }
 
     impl Default for Config {
         fn default() -> Self {
             Self {
+                schema_version: 2,
                 enabled_tools: vec![
-                    "homebrew".into(),
                     "rust".into(),
                     "node".into(),
                     "npm".into(),
                     "pnpm".into(),
                     "go".into(),
+                    "bun".into(),
+                    "deno".into(),
+                    "uv".into(),
                 ],
+                enabled_inventories: vec!["homebrew".into()],
                 history_limit: 500,
                 command_timeout_seconds: 120,
-                preferred_install_manager: "homebrew".into(),
             }
         }
     }
@@ -435,7 +487,15 @@ pub mod config {
         if !path.exists() {
             return Ok(Config::default());
         }
-        toml::from_str(&fs::read_to_string(path)?).context("invalid Beacon config")
+        let config: Config =
+            toml::from_str(&fs::read_to_string(path)?).context("invalid Beacon config")?;
+        if config.schema_version > 2 {
+            bail!(
+                "unsupported Beacon config schema version {}",
+                config.schema_version
+            );
+        }
+        Ok(config)
     }
     pub fn load() -> Result<Config> {
         load_from(&path()?)
@@ -444,16 +504,83 @@ pub mod config {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        fs::write(path, toml::to_string_pretty(config)?)?;
+        atomic_write(path, toml::to_string_pretty(config)?.as_bytes())?;
+        Ok(())
+    }
+
+    fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
+        let temporary = path.with_extension("toml.tmp");
+        fs::write(&temporary, bytes)?;
+        fs::rename(temporary, path)?;
+        Ok(())
+    }
+
+    fn migrate_v1(path: &Path, source: &str) -> Result<()> {
+        use toml_edit::{Array, DocumentMut, value};
+
+        let mut document = source
+            .parse::<DocumentMut>()
+            .context("invalid Beacon config")?;
+        let version = document
+            .get("schema_version")
+            .and_then(|item| item.as_integer())
+            .unwrap_or(1);
+        if version > 2 {
+            bail!("unsupported Beacon config schema version {version}");
+        }
+        if version == 2 {
+            return Ok(());
+        }
+
+        let backup = path.with_file_name("config.toml.v1.bak");
+        if !backup.exists() {
+            fs::write(&backup, source)?;
+        }
+        let mut tools = Array::new();
+        let mut homebrew_was_enabled = false;
+        if let Some(existing) = document
+            .get("enabled_tools")
+            .and_then(|item| item.as_array())
+        {
+            for tool in existing.iter().filter_map(|item| item.as_str()) {
+                if tool == "homebrew" {
+                    homebrew_was_enabled = true;
+                } else {
+                    tools.push(tool);
+                }
+            }
+        } else {
+            homebrew_was_enabled = true;
+            for tool in Config::default().enabled_tools {
+                tools.push(tool);
+            }
+        }
+        let mut inventories = Array::new();
+        if homebrew_was_enabled {
+            inventories.push("homebrew");
+        }
+        document["schema_version"] = value(2);
+        document["enabled_tools"] = value(tools);
+        document["enabled_inventories"] = value(inventories);
+        document.remove("preferred_install_manager");
+        atomic_write(path, document.to_string().as_bytes())?;
         Ok(())
     }
     pub fn ensure() -> Result<(Config, PathBuf)> {
         let path = path()?;
-        let config = load_from(&path)?;
-        if !path.exists() {
-            save_to(&config, &path)?;
+        ensure_at(&path)
+    }
+
+    pub fn ensure_at(path: &Path) -> Result<(Config, PathBuf)> {
+        if path.exists() {
+            let source = fs::read_to_string(path)?;
+            migrate_v1(path, &source)?;
         }
-        Ok((config, path))
+        let config = load_from(path)?;
+        if !path.exists() {
+            save_to(&config, path)?;
+        }
+        Ok((config, path.to_path_buf()))
     }
 }
 
@@ -702,7 +829,7 @@ pub mod runner {
 }
 
 pub mod store {
-    use crate::{Manager, ToolReport};
+    use crate::CheckData;
     use anyhow::Result;
     use chrono::Utc;
     use rusqlite::{Connection, params};
@@ -717,7 +844,8 @@ pub mod store {
         pub tool: String,
         pub old_version: Option<String>,
         pub new_version: Option<String>,
-        pub manager: String,
+        pub installation_source: String,
+        pub update_manager: String,
         pub status: String,
         pub summary: String,
     }
@@ -730,14 +858,63 @@ pub mod store {
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            let store = Self {
+            let mut store = Self {
                 connection: Connection::open(path)?,
             };
             store.migrate()?;
             Ok(store)
         }
-        fn migrate(&self) -> Result<()> {
-            self.connection.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE IF NOT EXISTS history (id INTEGER PRIMARY KEY, created_at TEXT NOT NULL, operation TEXT NOT NULL, tool TEXT NOT NULL, old_version TEXT, new_version TEXT, manager TEXT NOT NULL, status TEXT NOT NULL, summary TEXT NOT NULL); CREATE TABLE IF NOT EXISTS snapshots (id INTEGER PRIMARY KEY, created_at TEXT NOT NULL, payload TEXT NOT NULL);")?;
+        fn migrate(&mut self) -> Result<()> {
+            self.connection.execute_batch("PRAGMA journal_mode=WAL;")?;
+            let transaction = self.connection.transaction()?;
+            transaction.execute_batch(
+                "CREATE TABLE IF NOT EXISTS history (
+                    id INTEGER PRIMARY KEY,
+                    created_at TEXT NOT NULL,
+                    operation TEXT NOT NULL,
+                    tool TEXT NOT NULL,
+                    old_version TEXT,
+                    new_version TEXT,
+                    installation_source TEXT NOT NULL DEFAULT 'unknown',
+                    update_manager TEXT NOT NULL DEFAULT 'unknown',
+                    status TEXT NOT NULL,
+                    summary TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS snapshots (
+                    id INTEGER PRIMARY KEY,
+                    created_at TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    payload_schema_version INTEGER NOT NULL DEFAULT 2
+                );",
+            )?;
+            let history_columns = table_columns(&transaction, "history")?;
+            if !history_columns
+                .iter()
+                .any(|column| column == "installation_source")
+            {
+                transaction.execute("ALTER TABLE history ADD COLUMN installation_source TEXT NOT NULL DEFAULT 'unknown'", [])?;
+            }
+            if !history_columns
+                .iter()
+                .any(|column| column == "update_manager")
+            {
+                transaction.execute(
+                    "ALTER TABLE history ADD COLUMN update_manager TEXT NOT NULL DEFAULT 'unknown'",
+                    [],
+                )?;
+            }
+            if history_columns.iter().any(|column| column == "manager") {
+                transaction.execute("UPDATE history SET installation_source = manager WHERE installation_source = 'unknown'", [])?;
+            }
+            let snapshot_columns = table_columns(&transaction, "snapshots")?;
+            if !snapshot_columns
+                .iter()
+                .any(|column| column == "payload_schema_version")
+            {
+                transaction.execute("ALTER TABLE snapshots ADD COLUMN payload_schema_version INTEGER NOT NULL DEFAULT 1", [])?;
+            }
+            transaction.pragma_update(None, "user_version", 2)?;
+            transaction.commit()?;
             Ok(())
         }
         #[allow(clippy::too_many_arguments)]
@@ -747,22 +924,23 @@ pub mod store {
             tool: &str,
             old: Option<&str>,
             new: Option<&str>,
-            manager: Manager,
+            installation_source: &str,
+            update_manager: &str,
             status: &str,
             summary: &str,
         ) -> Result<()> {
-            self.connection.execute("INSERT INTO history(created_at,operation,tool,old_version,new_version,manager,status,summary) VALUES(?,?,?,?,?,?,?,?)", params![Utc::now().to_rfc3339(), operation, tool, old, new, manager.to_string(), status, summary])?;
+            self.connection.execute("INSERT INTO history(created_at,operation,tool,old_version,new_version,installation_source,update_manager,status,summary) VALUES(?,?,?,?,?,?,?,?,?)", params![Utc::now().to_rfc3339(), operation, tool, old, new, installation_source, update_manager, status, summary])?;
             Ok(())
         }
-        pub fn snapshot(&self, reports: &[ToolReport]) -> Result<()> {
+        pub fn snapshot(&self, reports: &CheckData) -> Result<()> {
             self.connection.execute(
-                "INSERT INTO snapshots(created_at,payload) VALUES(?,?)",
+                "INSERT INTO snapshots(created_at,payload,payload_schema_version) VALUES(?,?,2)",
                 params![Utc::now().to_rfc3339(), serde_json::to_string(reports)?],
             )?;
             Ok(())
         }
         pub fn history(&self, limit: usize) -> Result<Vec<HistoryEntry>> {
-            let mut statement = self.connection.prepare("SELECT id,created_at,operation,tool,old_version,new_version,manager,status,summary FROM history ORDER BY id DESC LIMIT ?")?;
+            let mut statement = self.connection.prepare("SELECT id,created_at,operation,tool,old_version,new_version,installation_source,update_manager,status,summary FROM history ORDER BY id DESC LIMIT ?")?;
             Ok(statement
                 .query_map([limit as i64], |row| {
                     Ok(HistoryEntry {
@@ -772,9 +950,10 @@ pub mod store {
                         tool: row.get(3)?,
                         old_version: row.get(4)?,
                         new_version: row.get(5)?,
-                        manager: row.get(6)?,
-                        status: row.get(7)?,
-                        summary: row.get(8)?,
+                        installation_source: row.get(6)?,
+                        update_manager: row.get(7)?,
+                        status: row.get(8)?,
+                        summary: row.get(9)?,
                     })
                 })?
                 .collect::<Result<Vec<_>, _>>()?)
@@ -783,6 +962,19 @@ pub mod store {
             self.connection.execute("DELETE FROM history WHERE id NOT IN (SELECT id FROM history ORDER BY id DESC LIMIT ?)", [limit as i64])?;
             Ok(())
         }
+
+        pub fn schema_version(&self) -> Result<u8> {
+            Ok(self
+                .connection
+                .pragma_query_value(None, "user_version", |row| row.get(0))?)
+        }
+    }
+
+    fn table_columns(connection: &Connection, table: &str) -> Result<Vec<String>> {
+        let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
+        Ok(statement
+            .query_map([], |row| row.get(1))?
+            .collect::<std::result::Result<Vec<String>, _>>()?)
     }
 }
 

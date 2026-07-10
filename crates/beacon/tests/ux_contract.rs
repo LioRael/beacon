@@ -1,23 +1,38 @@
 use beacon::{
-    Manager, ToolReport, ToolStatus,
+    Diagnostics, InstallationReport, ToolReport, ToolStatus, UpdateReport,
     command::CommandSpec,
+    providers::{ManagerId, SourceId, TargetMode, ToolVersion, UpgradeAction},
     runner::sanitize_verbose_line,
     ui::{FeedbackMode, spinner_template, status_text},
     upgrade::{resolve_targets, upgrade_candidates},
 };
 
 fn report(id: &str, status: ToolStatus) -> ToolReport {
+    let current = ToolVersion::new("1.0.0", Some("1.0.0".into())).unwrap();
+    let latest = ToolVersion::new("2.0.0", Some("2.0.0".into())).unwrap();
+    let manager = ManagerId::new("homebrew").unwrap();
     ToolReport {
         id: id.into(),
         name: id.into(),
-        current: (status != ToolStatus::Missing).then(|| "1.0.0".into()),
-        latest: Some("2.0.0".into()),
         status,
-        manager: Manager::Homebrew,
-        executable: None,
-        other_sources: vec![],
         detail: None,
-        action: Some(CommandSpec::new("brew", ["upgrade", id])),
+        installation: (status != ToolStatus::Missing).then(|| InstallationReport {
+            current,
+            executable: format!("/opt/homebrew/bin/{id}"),
+            source: Some(SourceId::new("homebrew").unwrap()),
+            alternatives: vec![],
+        }),
+        update: Some(UpdateReport {
+            manager: manager.clone(),
+            latest: latest.clone(),
+            action: UpgradeAction {
+                manager,
+                command: CommandSpec::new("brew", ["upgrade", "--formula", id]),
+                expected_version: latest,
+                target_mode: TargetMode::Floating,
+            },
+        }),
+        diagnostics: Diagnostics::default(),
     }
 }
 

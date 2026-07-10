@@ -1,6 +1,6 @@
 {
   "name": "@liorael/beacon",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "A conservative macOS development toolchain update manager",
   "license": "MIT",
   "repository": {
@@ -34,4 +34,3 @@
     "test": "node --test test/*.test.mjs"
   }
 }
-

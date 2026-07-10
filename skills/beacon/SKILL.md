@@ -1,6 +1,6 @@
 ---
 name: beacon
-description: Manage a macOS development toolchain with the Beacon CLI. Use when the user mentions Beacon or asks to check, diagnose, or safely upgrade Homebrew, Rust, Node, npm, pnpm, or Go installations. Do not use for project dependency upgrades, ordinary macOS application updates, or unrelated software management.
+description: Manage a macOS development toolchain with the Beacon CLI. Use when the user mentions Beacon or asks to check, diagnose, or safely upgrade Homebrew, Rust, Node, npm, pnpm, Go, Bun, Deno, or uv installations. Do not use for project dependency upgrades, ordinary macOS application updates, or unrelated software management.
 ---
 
 # Beacon
@@ -31,7 +31,7 @@ beacon history --json
 beacon config show --json
 ```
 
-Parse the JSON envelope rather than scraping colored terminal output. Summarize current, outdated, missing, unavailable, and failed tools. Preserve the distinction between the active executable's source manager and the command used to upgrade it. Report missing tools; never pass them to `upgrade`.
+Require `schema_version: 2` and parse the JSON envelope rather than scraping colored terminal output. Traverse `data.tools` and `data.inventories` separately. Treat `installation` and `update` as explicitly nullable. Summarize current, outdated, missing, unmanaged, and failed tools. Preserve `installation.source` separately from `update.manager` in every summary and confirmation. Report missing tools; never pass missing or unmanaged tools to `upgrade`.
 
 Use `doctor` when the user asks why a tool, version, path, or manager was detected. Use `history` only when prior Beacon activity is relevant.
 
@@ -43,8 +43,9 @@ Show the user:
 
 - Each exact target.
 - Current and latest versions.
-- Detected source manager.
+- Detected installation source and update manager.
 - The exact action Beacon reports.
+- Whether the action has an `exact` or `floating` target mode.
 
 Ask for explicit confirmation of the final target set after showing this information. A prior general request such as "update my environment" is not the required final confirmation.
 
