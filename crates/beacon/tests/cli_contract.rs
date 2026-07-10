@@ -76,6 +76,56 @@ fn history_json_uses_the_versioned_envelope() {
 }
 
 #[test]
+fn history_json_records_source_and_updater_without_manager_field() {
+    let home = tempfile::tempdir().unwrap();
+    let path = tempfile::tempdir().unwrap();
+    let check = Command::new(env!("CARGO_BIN_EXE_beacon"))
+        .args(["check", "--json"])
+        .env("HOME", home.path())
+        .env("PATH", path.path())
+        .output()
+        .unwrap();
+    assert!(
+        check.status.success(),
+        "{}",
+        String::from_utf8_lossy(&check.stderr)
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_beacon"))
+        .args(["history", "--json"])
+        .env("HOME", home.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["schema_version"], 2);
+    let entries = value["data"].as_array().unwrap();
+    assert!(
+        !entries.is_empty(),
+        "check must persist a history entry: {value}"
+    );
+    for entry in entries {
+        assert!(
+            entry.get("manager").is_none(),
+            "history must not expose ambiguous manager field: {entry}"
+        );
+        assert!(
+            entry["installation_source"].is_string(),
+            "history must expose installation_source: {entry}"
+        );
+        assert!(
+            entry["update_manager"].is_string(),
+            "history must expose update_manager: {entry}"
+        );
+        assert_eq!(entry["operation"], "check");
+    }
+}
+
+#[test]
 fn check_json_v2_separates_tools_and_inventories_and_uses_explicit_nulls() {
     let home = tempfile::tempdir().unwrap();
     let path = tempfile::tempdir().unwrap();

@@ -270,6 +270,16 @@ fn stale_plan_aborts_before_mutation_and_persists_recovery() {
         summary.contains("Inspect PATH") || summary.contains("reinstall"),
         "history must persist recovery guidance, got {summary}"
     );
+    assert!(
+        failed.get("manager").is_none(),
+        "history must not expose ambiguous manager field: {failed}"
+    );
+    assert_eq!(failed["installation_source"], "deno-official");
+    assert_eq!(failed["update_manager"], "deno-official");
+    assert!(
+        !summary.contains(fixture.home.path().to_str().unwrap()),
+        "history summary must be redacted, got {summary}"
+    );
 }
 
 #[test]
@@ -300,6 +310,23 @@ fn exact_upgrade_succeeds_only_when_result_equals_expected_version() {
         std::fs::read_to_string(&fixture.version).unwrap().trim(),
         "2.1.1"
     );
+
+    let history = history_json(fixture.home.path());
+    let success = history["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| {
+            entry["operation"] == "upgrade"
+                && entry["tool"] == "deno"
+                && entry["status"] == "success"
+        })
+        .unwrap_or_else(|| panic!("successful upgrade must be persisted: {history}"));
+    assert!(success.get("manager").is_none(), "{success}");
+    assert_eq!(success["installation_source"], "deno-official");
+    assert_eq!(success["update_manager"], "deno-official");
+    assert_eq!(success["old_version"], "2.1.0");
+    assert_eq!(success["new_version"], "2.1.1");
 }
 
 #[test]

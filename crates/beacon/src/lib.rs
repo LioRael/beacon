@@ -841,11 +841,39 @@ pub mod runner {
 
 pub mod store {
     use crate::CheckData;
-    use anyhow::Result;
+    use anyhow::{Result, bail};
     use chrono::Utc;
-    use rusqlite::{Connection, params};
+    use rusqlite::{Connection, Transaction, params};
     use serde::Serialize;
     use std::path::Path;
+
+    fn history_v2_ddl(table: &str) -> String {
+        format!(
+            "CREATE TABLE {table} (
+                    id INTEGER PRIMARY KEY,
+                    created_at TEXT NOT NULL,
+                    operation TEXT NOT NULL,
+                    tool TEXT NOT NULL,
+                    old_version TEXT,
+                    new_version TEXT,
+                    installation_source TEXT NOT NULL DEFAULT 'unknown',
+                    update_manager TEXT NOT NULL DEFAULT 'unknown',
+                    status TEXT NOT NULL,
+                    summary TEXT NOT NULL
+                )"
+        )
+    }
+
+    fn snapshots_v2_ddl(table: &str) -> String {
+        format!(
+            "CREATE TABLE {table} (
+                    id INTEGER PRIMARY KEY,
+                    created_at TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    payload_schema_version INTEGER NOT NULL DEFAULT 2
+                )"
+        )
+    }
 
     #[derive(Debug, Serialize)]
     pub struct HistoryEntry {
@@ -859,6 +887,14 @@ pub mod store {
         pub update_manager: String,
         pub status: String,
         pub summary: String,
+    }
+
+    #[derive(Debug, Serialize)]
+    pub struct SnapshotEntry {
+        pub id: i64,
+        pub created_at: String,
+        pub payload: String,
+        pub payload_schema_version: u8,
     }
 
     pub struct Store {
@@ -875,59 +911,26 @@ pub mod store {
             store.migrate()?;
             Ok(store)
         }
+
         fn migrate(&mut self) -> Result<()> {
+            let current_version: i64 =
+                self.connection
+                    .pragma_query_value(None, "user_version", |row| row.get(0))?;
+            if current_version > 2 {
+                bail!("unsupported Beacon database schema version {current_version}");
+            }
             self.connection.execute_batch("PRAGMA journal_mode=WAL;")?;
+            // Always enforce the v2 physical schema. A prior ALTER-only path could
+            // stamp user_version=2 while leaving history.manager NOT NULL, which
+            // breaks subsequent inserts; heal that intermediate shape on open.
             let transaction = self.connection.transaction()?;
-            transaction.execute_batch(
-                "CREATE TABLE IF NOT EXISTS history (
-                    id INTEGER PRIMARY KEY,
-                    created_at TEXT NOT NULL,
-                    operation TEXT NOT NULL,
-                    tool TEXT NOT NULL,
-                    old_version TEXT,
-                    new_version TEXT,
-                    installation_source TEXT NOT NULL DEFAULT 'unknown',
-                    update_manager TEXT NOT NULL DEFAULT 'unknown',
-                    status TEXT NOT NULL,
-                    summary TEXT NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS snapshots (
-                    id INTEGER PRIMARY KEY,
-                    created_at TEXT NOT NULL,
-                    payload TEXT NOT NULL,
-                    payload_schema_version INTEGER NOT NULL DEFAULT 2
-                );",
-            )?;
-            let history_columns = table_columns(&transaction, "history")?;
-            if !history_columns
-                .iter()
-                .any(|column| column == "installation_source")
-            {
-                transaction.execute("ALTER TABLE history ADD COLUMN installation_source TEXT NOT NULL DEFAULT 'unknown'", [])?;
-            }
-            if !history_columns
-                .iter()
-                .any(|column| column == "update_manager")
-            {
-                transaction.execute(
-                    "ALTER TABLE history ADD COLUMN update_manager TEXT NOT NULL DEFAULT 'unknown'",
-                    [],
-                )?;
-            }
-            if history_columns.iter().any(|column| column == "manager") {
-                transaction.execute("UPDATE history SET installation_source = manager WHERE installation_source = 'unknown'", [])?;
-            }
-            let snapshot_columns = table_columns(&transaction, "snapshots")?;
-            if !snapshot_columns
-                .iter()
-                .any(|column| column == "payload_schema_version")
-            {
-                transaction.execute("ALTER TABLE snapshots ADD COLUMN payload_schema_version INTEGER NOT NULL DEFAULT 1", [])?;
-            }
+            migrate_history_to_v2(&transaction)?;
+            migrate_snapshots_to_v2(&transaction)?;
             transaction.pragma_update(None, "user_version", 2)?;
             transaction.commit()?;
             Ok(())
         }
+
         #[allow(clippy::too_many_arguments)]
         pub fn record(
             &self,
@@ -940,9 +943,23 @@ pub mod store {
             status: &str,
             summary: &str,
         ) -> Result<()> {
-            self.connection.execute("INSERT INTO history(created_at,operation,tool,old_version,new_version,installation_source,update_manager,status,summary) VALUES(?,?,?,?,?,?,?,?,?)", params![Utc::now().to_rfc3339(), operation, tool, old, new, installation_source, update_manager, status, summary])?;
+            self.connection.execute(
+                "INSERT INTO history(created_at,operation,tool,old_version,new_version,installation_source,update_manager,status,summary) VALUES(?,?,?,?,?,?,?,?,?)",
+                params![
+                    Utc::now().to_rfc3339(),
+                    operation,
+                    tool,
+                    old,
+                    new,
+                    installation_source,
+                    update_manager,
+                    status,
+                    summary
+                ],
+            )?;
             Ok(())
         }
+
         pub fn snapshot(&self, reports: &CheckData) -> Result<()> {
             self.connection.execute(
                 "INSERT INTO snapshots(created_at,payload,payload_schema_version) VALUES(?,?,2)",
@@ -950,8 +967,11 @@ pub mod store {
             )?;
             Ok(())
         }
+
         pub fn history(&self, limit: usize) -> Result<Vec<HistoryEntry>> {
-            let mut statement = self.connection.prepare("SELECT id,created_at,operation,tool,old_version,new_version,installation_source,update_manager,status,summary FROM history ORDER BY id DESC LIMIT ?")?;
+            let mut statement = self.connection.prepare(
+                "SELECT id,created_at,operation,tool,old_version,new_version,installation_source,update_manager,status,summary FROM history ORDER BY id DESC LIMIT ?",
+            )?;
             Ok(statement
                 .query_map([limit as i64], |row| {
                     Ok(HistoryEntry {
@@ -969,8 +989,28 @@ pub mod store {
                 })?
                 .collect::<Result<Vec<_>, _>>()?)
         }
+
+        pub fn snapshots(&self, limit: usize) -> Result<Vec<SnapshotEntry>> {
+            let mut statement = self.connection.prepare(
+                "SELECT id,created_at,payload,payload_schema_version FROM snapshots ORDER BY id DESC LIMIT ?",
+            )?;
+            Ok(statement
+                .query_map([limit as i64], |row| {
+                    Ok(SnapshotEntry {
+                        id: row.get(0)?,
+                        created_at: row.get(1)?,
+                        payload: row.get(2)?,
+                        payload_schema_version: row.get(3)?,
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()?)
+        }
+
         pub fn prune(&self, limit: usize) -> Result<()> {
-            self.connection.execute("DELETE FROM history WHERE id NOT IN (SELECT id FROM history ORDER BY id DESC LIMIT ?)", [limit as i64])?;
+            self.connection.execute(
+                "DELETE FROM history WHERE id NOT IN (SELECT id FROM history ORDER BY id DESC LIMIT ?)",
+                [limit as i64],
+            )?;
             Ok(())
         }
 
@@ -979,6 +1019,128 @@ pub mod store {
                 .connection
                 .pragma_query_value(None, "user_version", |row| row.get(0))?)
         }
+    }
+
+    fn migrate_history_to_v2(transaction: &Transaction<'_>) -> Result<()> {
+        if !table_exists(transaction, "history")? {
+            transaction.execute_batch(&history_v2_ddl("history"))?;
+            return Ok(());
+        }
+
+        let columns = table_columns(transaction, "history")?;
+        require_history_columns(&columns)?;
+        let has_manager = columns.iter().any(|column| column == "manager");
+        let has_source = columns.iter().any(|column| column == "installation_source");
+        let has_updater = columns.iter().any(|column| column == "update_manager");
+        if !has_manager && has_source && has_updater {
+            return Ok(());
+        }
+
+        transaction.execute_batch("DROP TABLE IF EXISTS history_v2_migration;")?;
+        transaction.execute_batch(&history_v2_ddl("history_v2_migration"))?;
+
+        // require_history_columns guarantees manager and/or installation_source exist.
+        let source_expr = if has_source && has_manager {
+            "CASE WHEN installation_source = 'unknown' THEN manager ELSE installation_source END"
+        } else if has_source {
+            "installation_source"
+        } else {
+            "manager"
+        };
+        let updater_expr = if has_updater {
+            "update_manager"
+        } else {
+            "'unknown'"
+        };
+
+        transaction.execute(
+            &format!(
+                "INSERT INTO history_v2_migration(
+                    id, created_at, operation, tool, old_version, new_version,
+                    installation_source, update_manager, status, summary
+                )
+                SELECT
+                    id, created_at, operation, tool, old_version, new_version,
+                    {source_expr}, {updater_expr}, status, summary
+                FROM history"
+            ),
+            [],
+        )?;
+        transaction.execute_batch(
+            "DROP TABLE history;
+             ALTER TABLE history_v2_migration RENAME TO history;",
+        )?;
+        Ok(())
+    }
+
+    fn migrate_snapshots_to_v2(transaction: &Transaction<'_>) -> Result<()> {
+        if !table_exists(transaction, "snapshots")? {
+            transaction.execute_batch(&snapshots_v2_ddl("snapshots"))?;
+            return Ok(());
+        }
+
+        let columns = table_columns(transaction, "snapshots")?;
+        require_snapshot_columns(&columns)?;
+        if columns
+            .iter()
+            .any(|column| column == "payload_schema_version")
+        {
+            return Ok(());
+        }
+
+        transaction.execute_batch("DROP TABLE IF EXISTS snapshots_v2_migration;")?;
+        transaction.execute_batch(&snapshots_v2_ddl("snapshots_v2_migration"))?;
+        transaction.execute(
+            "INSERT INTO snapshots_v2_migration(id, created_at, payload, payload_schema_version)
+             SELECT id, created_at, payload, 1 FROM snapshots",
+            [],
+        )?;
+        transaction.execute_batch(
+            "DROP TABLE snapshots;
+             ALTER TABLE snapshots_v2_migration RENAME TO snapshots;",
+        )?;
+        Ok(())
+    }
+
+    fn require_history_columns(columns: &[String]) -> Result<()> {
+        for required in [
+            "id",
+            "created_at",
+            "operation",
+            "tool",
+            "old_version",
+            "new_version",
+            "status",
+            "summary",
+        ] {
+            if !columns.iter().any(|column| column == required) {
+                bail!("cannot migrate history table: missing column {required}");
+            }
+        }
+        if !columns.iter().any(|column| column == "manager")
+            && !columns.iter().any(|column| column == "installation_source")
+        {
+            bail!("cannot migrate history table: missing manager ownership columns");
+        }
+        Ok(())
+    }
+
+    fn require_snapshot_columns(columns: &[String]) -> Result<()> {
+        for required in ["id", "created_at", "payload"] {
+            if !columns.iter().any(|column| column == required) {
+                bail!("cannot migrate snapshots table: missing column {required}");
+            }
+        }
+        Ok(())
+    }
+
+    fn table_exists(connection: &Connection, table: &str) -> Result<bool> {
+        let count: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?",
+            [table],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
     }
 
     fn table_columns(connection: &Connection, table: &str) -> Result<Vec<String>> {
