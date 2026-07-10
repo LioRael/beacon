@@ -65,6 +65,32 @@ fn explicitly_upgrading_a_missing_tool_explains_the_boundary() {
 }
 
 #[test]
+fn machine_reports_keep_missing_unmanaged_and_failed_states_distinct() {
+    let mut missing = report("missing", ToolStatus::Missing);
+    missing.update = None;
+    let mut unmanaged = report("unmanaged", ToolStatus::Unmanaged);
+    unmanaged.update = None;
+    let mut failed = report("failed", ToolStatus::Failed);
+    failed.update = None;
+    failed.detail = Some("redacted diagnostic".into());
+
+    let value = serde_json::to_value([missing, unmanaged, failed]).unwrap();
+
+    assert_eq!(value[0]["status"], "missing");
+    assert!(value[0]["installation"].is_null());
+    assert!(value[0]["update"].is_null());
+    assert!(value[0]["diagnostics"].is_object());
+
+    assert_eq!(value[1]["status"], "unmanaged");
+    assert!(value[1]["installation"].is_object());
+    assert!(value[1]["update"].is_null());
+
+    assert_eq!(value[2]["status"], "failed");
+    assert_ne!(value[2]["status"], "current");
+    assert_eq!(value[2]["detail"], "redacted diagnostic");
+}
+
+#[test]
 fn status_colors_can_be_disabled() {
     let plain = status_text(ToolStatus::Outdated, false, 8);
     let colored = status_text(ToolStatus::Outdated, true, 8);
