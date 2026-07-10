@@ -629,9 +629,7 @@ impl BuiltinInstallManager {
             }
             ManagerKind::BunOfficial => tool.id.as_str() == "bun" && path.contains("/.bun/"),
             ManagerKind::DenoOfficial => tool.id.as_str() == "deno" && path.contains("/.deno/"),
-            ManagerKind::UvStandalone => {
-                tool.id.as_str() == "uv" && path.contains("/.local/bin/uv")
-            }
+            ManagerKind::UvStandalone => false,
         }
     }
 
@@ -656,7 +654,7 @@ impl BuiltinInstallManager {
                 ManagerKind::Corepack => path.contains("corepack") || path.contains("/shims/"),
                 ManagerKind::BunOfficial => path.contains("/.bun/"),
                 ManagerKind::DenoOfficial => path.contains("/.deno/"),
-                ManagerKind::UvStandalone => path.contains("/.local/bin/uv"),
+                ManagerKind::UvStandalone => false,
             }
         }) {
             ClaimConfidence::CanonicalPath
@@ -770,6 +768,41 @@ impl InstallManager for BuiltinInstallManager {
                 evidence,
             });
         }
+        if self.kind == ManagerKind::UvStandalone {
+            let executable = context
+                .execute_silent(&CommandSpec::new("/usr/bin/which", ["uv"]))
+                .await?
+                .stdout
+                .lines()
+                .next()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .context("uv is not available on PATH")?
+                .to_string();
+            let output = context
+                .execute(
+                    "Reading uv standalone manager state",
+                    &CommandSpec::new(&executable, ["self", "update", "--dry-run"]),
+                )
+                .await?;
+            let manager_output = format!("{}\n{}", output.stdout, output.stderr);
+            return Ok(ManagerSnapshot {
+                manager: self.id(),
+                evidence: vec![
+                    ManagerEvidence {
+                        kind: "manager-output".into(),
+                        value: crate::redact::redact(
+                            manager_output.trim(),
+                            std::env::var("HOME").ok().as_deref(),
+                        ),
+                    },
+                    ManagerEvidence {
+                        kind: "receipt".into(),
+                        value: format!("uv {executable}"),
+                    },
+                ],
+            });
+        }
         let command = match self.kind {
             ManagerKind::Homebrew => unreachable!("Homebrew snapshot handled above"),
             ManagerKind::Mise => CommandSpec::new("mise", ["ls", "--json"]),
@@ -778,7 +811,7 @@ impl InstallManager for BuiltinInstallManager {
             ManagerKind::Corepack => CommandSpec::new("corepack", ["--version"]),
             ManagerKind::BunOfficial => CommandSpec::new("bun", ["--version"]),
             ManagerKind::DenoOfficial => CommandSpec::new("deno", ["--version"]),
-            ManagerKind::UvStandalone => CommandSpec::new("uv", ["--version"]),
+            ManagerKind::UvStandalone => unreachable!("uv snapshot handled above"),
         };
         let output = context
             .execute(&format!("Reading {} manager state", self.id), &command)
@@ -966,7 +999,20 @@ impl InstallManager for BuiltinInstallManager {
                 ],
             ),
             ManagerKind::DenoOfficial => CommandSpec::new("deno", ["upgrade", "--dry-run"]),
-            ManagerKind::UvStandalone => CommandSpec::new("uv", ["self", "update", "--dry-run"]),
+            ManagerKind::UvStandalone => {
+                let output = snapshot
+                    .evidence
+                    .iter()
+                    .find(|evidence| evidence.kind == "manager-output")
+                    .map(|evidence| evidence.value.as_str())
+                    .context("uv standalone snapshot had no update result")?;
+                let normalized = output
+                    .split_whitespace()
+                    .filter_map(version_number)
+                    .next_back()
+                    .context("uv standalone update result had no version")?;
+                return ToolVersion::new(normalized.clone(), Some(normalized));
+            }
         };
         let output = context
             .execute(&format!("Checking latest {} version", tool.id), &command)

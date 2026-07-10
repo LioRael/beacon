@@ -670,3 +670,275 @@ fn bun_and_deno_stay_unmanaged_without_reliable_or_global_provenance() {
         }
     }
 }
+fn uv_report(value: &serde_json::Value) -> &serde_json::Value {
+    value["data"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["id"] == "uv")
+        .unwrap()
+}
+
+#[test]
+fn missing_uv_has_no_latest_or_upgrade_action() {
+    let home = tempfile::tempdir().unwrap();
+    let path = tempfile::tempdir().unwrap();
+
+    let check = Command::new(env!("CARGO_BIN_EXE_beacon"))
+        .args(["check", "--json"])
+        .env("HOME", home.path())
+        .env("PATH", path.path())
+        .output()
+        .unwrap();
+
+    assert!(check.status.success());
+    let value: serde_json::Value = serde_json::from_slice(&check.stdout).unwrap();
+    let uv = uv_report(&value);
+    assert_eq!(uv["status"], "missing");
+    assert!(uv["installation"].is_null());
+    assert!(uv["update"].is_null());
+
+    let upgrade = Command::new(env!("CARGO_BIN_EXE_beacon"))
+        .args(["upgrade", "uv", "--yes", "--json"])
+        .env("HOME", home.path())
+        .env("PATH", path.path())
+        .output()
+        .unwrap();
+    assert_eq!(upgrade.status.code(), Some(1));
+    let value: serde_json::Value = serde_json::from_slice(&upgrade.stdout).unwrap();
+    assert_eq!(value["status"], "error");
+    assert!(value["data"].is_null());
+}
+
+#[test]
+fn uv_without_a_reliable_updater_stays_unmanaged() {
+    let home = tempfile::tempdir().unwrap();
+    let fixture = tempfile::tempdir().unwrap();
+    let bin = fixture.path().join(".local/bin");
+    write_executable(
+        &bin.join("uv"),
+        "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then printf 'uv 0.6.0 (fixture)\\n'; exit 0; fi\nprintf 'self-update disabled\\n' >&2\nexit 1\n",
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_beacon"))
+        .args(["check", "--json"])
+        .env("HOME", home.path())
+        .env("PATH", &bin)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let uv = uv_report(&value);
+    assert_eq!(uv["status"], "unmanaged");
+    assert!(uv["installation"]["source"].is_null());
+    assert!(uv["update"].is_null());
+}
+
+#[test]
+fn uv_standalone_reports_latest_and_an_exact_action() {
+    let home = tempfile::tempdir().unwrap();
+    let fixture = tempfile::tempdir().unwrap();
+    let bin = fixture.path().join(".local/bin");
+    write_executable(
+        &bin.join("uv"),
+        "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then printf 'uv 0.6.0 (fixture)\\n'; else printf 'Would update uv from 0.6.0 to 0.7.0\\n'; fi\n",
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_beacon"))
+        .args(["check", "--json"])
+        .env("HOME", home.path())
+        .env("PATH", &bin)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let uv = uv_report(&value);
+    assert_eq!(uv["status"], "outdated");
+    assert_eq!(uv["installation"]["source"], "uv-standalone");
+    assert_eq!(uv["update"]["manager"], "uv-standalone");
+    assert_eq!(uv["update"]["latest"]["normalized"], "0.7.0");
+    assert_eq!(uv["update"]["action"]["target_mode"], "exact");
+    assert_eq!(
+        uv["update"]["action"]["command"]["args"],
+        serde_json::json!(["self", "update", "0.7.0"])
+    );
+}
+
+#[test]
+fn uv_diagnostic_installations_are_visible_but_unmanaged() {
+    for (source, relative_bin) in [
+        ("pip", ".venv/bin"),
+        ("pipx", "pipx/venvs/uv/bin"),
+        ("cargo", ".cargo/bin"),
+    ] {
+        let home = tempfile::tempdir().unwrap();
+        let fixture = tempfile::tempdir().unwrap();
+        let bin = fixture.path().join(relative_bin);
+        write_executable(
+            &bin.join("uv"),
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then printf 'uv 0.6.0 (fixture)\\n'; exit 0; fi\nexit 1\n",
+        );
+
+        let output = Command::new(env!("CARGO_BIN_EXE_beacon"))
+            .args(["doctor", "uv", "--json"])
+            .env("HOME", home.path())
+            .env("PATH", &bin)
+            .output()
+            .unwrap();
+
+        assert!(
+            output.status.success(),
+            "{source}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let uv = uv_report(&value);
+        assert_eq!(uv["status"], "unmanaged", "{source}");
+        assert_eq!(uv["installation"]["source"], source, "{source}");
+        assert!(uv["update"].is_null(), "{source}");
+        assert!(
+            uv["diagnostics"]["evidence"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|evidence| evidence["claim"] == "source" && evidence["id"] == source),
+            "{source}"
+        );
+    }
+}
+
+#[test]
+fn global_mise_uv_preserves_its_selector() {
+    let home = tempfile::tempdir().unwrap();
+    let fixture = tempfile::tempdir().unwrap();
+    let bin = fixture.path().join("mise/installs/uv/0.6/bin");
+    write_executable(
+        &bin.join("uv"),
+        "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then printf 'uv 0.6.0 (fixture)\\n'; exit 0; fi\nexit 1\n",
+    );
+    write_executable(
+        &bin.join("mise"),
+        &format!(
+            "#!/bin/sh\nif [ \"$1\" = ls ]; then printf '{{\"uv\":[{{\"version\":\"0.6.0\",\"requested_version\":\"0.6\",\"install_path\":\"{}\"}}]}}\\n'; else printf '0.6.1\\n'; fi\n",
+            fixture.path().join("mise/installs/uv/0.6").display()
+        ),
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_beacon"))
+        .args(["check", "--json"])
+        .env("HOME", home.path())
+        .env("PATH", &bin)
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let uv = uv_report(&value);
+    assert_eq!(uv["installation"]["source"], "mise");
+    assert_eq!(uv["update"]["manager"], "mise");
+    assert_eq!(uv["update"]["action"]["target_mode"], "floating");
+    assert_eq!(
+        uv["update"]["action"]["command"]["args"],
+        serde_json::json!(["use", "-g", "uv@0.6"])
+    );
+}
+
+#[test]
+fn homebrew_uv_reports_a_targeted_floating_action() {
+    let home = tempfile::tempdir().unwrap();
+    let fixture = tempfile::tempdir().unwrap();
+    let prefix = fixture.path().join("homebrew");
+    let bin = prefix.join("bin");
+    write_executable(
+        &bin.join("uv"),
+        "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then printf 'uv 0.6.0 (fixture)\\n'; exit 0; fi\nexit 1\n",
+    );
+    write_executable(
+        &bin.join("brew"),
+        &format!(
+            "#!/bin/sh\ncase \"$*\" in\n  update) exit 0 ;;\n  'list --formula --versions') printf 'uv 0.6.0\\n' ;;\n  'list --cask --versions') exit 0 ;;\n  --prefix) printf '{}\\n' ;;\n  'outdated --json=v2') printf '{{\"formulae\":[],\"casks\":[]}}\\n' ;;\n  'info --json=v2 uv') printf '{{\"formulae\":[{{\"versions\":{{\"stable\":\"0.7.0\"}}}}],\"casks\":[]}}\\n' ;;\n  'list --formula uv') printf '{}/bin/uv\\n' ;;\n  *) exit 1 ;;\nesac\n",
+            prefix.display(),
+            prefix.display()
+        ),
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_beacon"))
+        .args(["check", "--json"])
+        .env("HOME", home.path())
+        .env("PATH", &bin)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stderr: {}\nstdout: {}",
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let uv = uv_report(&value);
+    assert_eq!(uv["installation"]["source"], "homebrew");
+    assert_eq!(uv["update"]["manager"], "homebrew");
+    assert_eq!(uv["update"]["action"]["target_mode"], "floating");
+    assert_eq!(
+        uv["update"]["action"]["command"]["args"],
+        serde_json::json!(["upgrade", "--formula", "uv"])
+    );
+}
+
+#[test]
+fn conflicting_uv_receipts_are_unmanaged_in_doctor_json() {
+    let home = tempfile::tempdir().unwrap();
+    let fixture = tempfile::tempdir().unwrap();
+    let prefix = fixture.path().join("managed");
+    let bin = prefix.join("bin");
+    write_executable(
+        &bin.join("uv"),
+        "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then printf 'uv 0.6.0 (fixture)\\n'; exit 0; fi\nexit 1\n",
+    );
+    write_executable(
+        &bin.join("mise"),
+        &format!(
+            "#!/bin/sh\nprintf '{{\"uv\":[{{\"version\":\"0.6.0\",\"requested_version\":\"latest\",\"install_path\":\"{}\"}}]}}\\n'\n",
+            prefix.display()
+        ),
+    );
+    write_executable(
+        &bin.join("brew"),
+        &format!(
+            "#!/bin/sh\ncase \"$*\" in\n  'list --formula --versions') printf 'uv 0.6.0\\n' ;;\n  'list --cask --versions') exit 0 ;;\n  --prefix) printf '{}\\n' ;;\n  'outdated --json=v2') printf '{{\"formulae\":[],\"casks\":[]}}\\n' ;;\n  *) exit 1 ;;\nesac\n",
+            prefix.display()
+        ),
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_beacon"))
+        .args(["doctor", "uv", "--json"])
+        .env("HOME", home.path())
+        .env("PATH", &bin)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let uv = uv_report(&value);
+    assert_eq!(uv["status"], "unmanaged");
+    assert!(uv["installation"]["source"].is_null());
+    assert!(uv["update"].is_null());
+    let conflicts = uv["diagnostics"]["conflicts"].as_array().unwrap();
+    assert!(conflicts.iter().any(|item| item["id"] == "homebrew"));
+    assert!(conflicts.iter().any(|item| item["id"] == "mise"));
+}

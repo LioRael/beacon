@@ -419,6 +419,92 @@ fn provider_registries_are_compile_time_built_ins() {
 }
 
 #[test]
+fn uv_adapter_parses_and_compares_versions() {
+    let adapter = tool_registry()
+        .iter()
+        .find(|adapter| adapter.id().as_str() == "uv")
+        .unwrap();
+    let current = adapter
+        .parse_version("uv 0.6.0 (fixture 2026-01-01)")
+        .unwrap();
+    let latest = adapter.parse_version("uv 0.7.0").unwrap();
+
+    assert_eq!(current.raw(), "0.6.0");
+    assert_eq!(current.display(), "0.6.0");
+    assert_eq!(
+        adapter.compare(&current, &latest).unwrap(),
+        std::cmp::Ordering::Less
+    );
+}
+
+#[test]
+fn project_mise_uv_is_diagnostic_only() {
+    let manager = install_manager_registry()
+        .iter()
+        .find(|manager| manager.id().as_str() == "mise")
+        .unwrap();
+    let executable = "/Users/alice/.local/share/mise/installs/uv/0.6/bin/uv";
+    let tool = beacon::providers::DetectedTool {
+        id: ToolId::new("uv").unwrap(),
+        executable: executable.into(),
+        version: ToolVersion::new("0.6.0", Some("0.6.0".into())).unwrap(),
+    };
+    let claims = manager.claim(
+        &tool,
+        &ManagerSnapshot {
+            manager: manager.id(),
+            evidence: vec![
+                ManagerEvidence {
+                    kind: "receipt".into(),
+                    value: format!("uv {executable}"),
+                },
+                ManagerEvidence {
+                    kind: "project-policy:uv".into(),
+                    value: "project mise selection".into(),
+                },
+            ],
+        },
+    );
+
+    assert_eq!(claims.source.unwrap().source.as_str(), "mise");
+    assert!(claims.updater.is_none());
+}
+
+#[test]
+fn conflicting_uv_receipts_produce_no_update_claim() {
+    let tool = beacon::providers::DetectedTool {
+        id: ToolId::new("uv").unwrap(),
+        executable: "/custom/bin/uv".into(),
+        version: ToolVersion::new("0.6.0", Some("0.6.0".into())).unwrap(),
+    };
+    let claims = ["homebrew", "mise"].map(|manager_id| {
+        let manager = install_manager_registry()
+            .iter()
+            .find(|manager| manager.id().as_str() == manager_id)
+            .unwrap();
+        manager.claim(
+            &tool,
+            &ManagerSnapshot {
+                manager: manager.id(),
+                evidence: vec![ManagerEvidence {
+                    kind: if manager_id == "homebrew" {
+                        "receipt:formula".into()
+                    } else {
+                        "receipt".into()
+                    },
+                    value: "uv /custom/bin/uv".into(),
+                }],
+            },
+        )
+    });
+
+    let resolved = resolve_claims(claims);
+    assert!(resolved.source.is_none());
+    assert!(resolved.updater.is_none());
+    assert_eq!(resolved.conflicts.len(), 4);
+}
+
+#[test]
 fn pnpm_supported_channels_choose_matching_source_updater_and_action() {
     struct Case {
         manager: &'static str,
