@@ -520,7 +520,7 @@ impl BuiltinInstallManager {
         }
         Ok(UpgradeAction {
             manager: self.id(),
-            command: CommandSpec::new("brew", ["upgrade", &format!("--{kind}"), name]),
+            command: CommandSpec::brew_inventory_upgrade(kind, name)?,
             expected_version: latest.clone(),
             target_mode: TargetMode::Floating,
         })

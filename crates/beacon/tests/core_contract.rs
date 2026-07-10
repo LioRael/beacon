@@ -8,10 +8,11 @@ use beacon::{
 
 #[test]
 fn homebrew_upgrade_always_has_a_target() {
-    assert!(CommandSpec::brew_upgrade("").is_err());
-    let command = CommandSpec::brew_upgrade("wget").unwrap();
+    assert!(CommandSpec::brew_inventory_upgrade("formula", "").is_err());
+    assert!(CommandSpec::brew_inventory_upgrade("tap", "wget").is_err());
+    let command = CommandSpec::brew_inventory_upgrade("formula", "wget").unwrap();
     assert_eq!(command.program, "brew");
-    assert_eq!(command.args, ["upgrade", "wget"]);
+    assert_eq!(command.args, ["upgrade", "--formula", "wget"]);
 }
 
 #[test]

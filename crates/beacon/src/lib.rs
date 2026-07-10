@@ -21,11 +21,14 @@ pub mod command {
             }
         }
 
-        pub fn brew_upgrade(target: &str) -> Result<Self> {
+        pub fn brew_inventory_upgrade(kind: &str, target: &str) -> Result<Self> {
             if target.trim().is_empty() {
                 bail!("Homebrew upgrade requires an explicit target");
             }
-            Ok(Self::new("brew", ["upgrade", target]))
+            if !matches!(kind, "formula" | "cask") {
+                bail!("Homebrew upgrade requires a formula or cask target kind");
+            }
+            Ok(Self::new("brew", ["upgrade", &format!("--{kind}"), target]))
         }
 
         pub fn display(&self) -> String {

@@ -63,6 +63,46 @@ fn check_json_v2_separates_tools_and_inventories_and_uses_explicit_nulls() {
     assert_eq!(node["status"], "missing");
     assert!(node["installation"].is_null());
     assert!(node["update"].is_null());
+    assert!(node["diagnostics"].is_object());
+}
+
+#[test]
+fn doctor_json_v2_separates_tools_and_inventories() {
+    let home = tempfile::tempdir().unwrap();
+    let path = tempfile::tempdir().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_beacon"))
+        .args(["doctor", "node", "--json"])
+        .env("HOME", home.path())
+        .env("PATH", path.path())
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    assert!(output.stderr.is_empty());
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["schema_version"], 2);
+    assert_eq!(value["status"], "ok");
+    assert!(value["errors"].as_array().unwrap().is_empty());
+    assert_eq!(value["data"]["tools"].as_array().unwrap().len(), 1);
+    assert!(value["data"]["inventories"].is_array());
+}
+
+#[test]
+fn config_show_json_uses_the_v2_envelope() {
+    let home = tempfile::tempdir().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_beacon"))
+        .args(["config", "show", "--json"])
+        .env("HOME", home.path())
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    assert!(output.stderr.is_empty());
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["schema_version"], 2);
+    assert_eq!(value["status"], "ok");
+    assert_eq!(value["data"]["schema_version"], 2);
+    assert!(value["errors"].as_array().unwrap().is_empty());
 }
 
 #[test]
@@ -82,6 +122,8 @@ fn partial_check_returns_structured_json_and_exit_two() {
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(2));
+    assert!(output.stderr.is_empty());
+    assert!(!output.stdout.contains(&0x1b));
     let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(value["status"], "partial");
     assert_eq!(value["errors"][0]["code"], "tool_failed");
@@ -100,6 +142,8 @@ fn fatal_json_commands_still_return_the_v2_envelope() {
         .unwrap();
 
     assert_eq!(output.status.code(), Some(1));
+    assert!(output.stderr.is_empty());
+    assert!(!output.stdout.contains(&0x1b));
     let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(value["schema_version"], 2);
     assert_eq!(value["status"], "error");
