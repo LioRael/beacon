@@ -1,0 +1,40 @@
+[package]
+name = "beacon-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "A conservative macOS CLI for checking, upgrading, and diagnosing development toolchains"
+repository = "https://github.com/liorael/beacon"
+homepage = "https://github.com/liorael/beacon"
+readme = "../../README.md"
+keywords = ["cli", "macos", "toolchain", "developer-tools", "updates"]
+categories = ["command-line-utilities", "development-tools"]
+
+[package.metadata.beacon]
+minimum-macos = "15.0"
+
+[lib]
+name = "beacon"
+path = "src/lib.rs"
+
+[[bin]]
+name = "beacon"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+chrono.workspace = true
+clap.workspace = true
+dialoguer.workspace = true
+directories.workspace = true
+rusqlite.workspace = true
+semver.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+toml.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -1,0 +1,46 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-15
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "15.0"
+      TARGET: aarch64-apple-darwin
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ env.TARGET }}
+      - name: Build release binary
+        run: cargo build --release --locked -p beacon-cli --target "$TARGET"
+      - name: Package release archive
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          artifact="beacon-${VERSION}-${TARGET}"
+          mkdir "$artifact"
+          cp "target/${TARGET}/release/beacon" "$artifact/beacon"
+          cp README.md LICENSE "$artifact/"
+          tar -czf "${artifact}.tar.gz" "$artifact"
+          shasum -a 256 "${artifact}.tar.gz" > "${artifact}.tar.gz.sha256"
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ github.ref_name }}
+        run: |
+          gh release create "$VERSION" \
+            "beacon-${VERSION}-${TARGET}.tar.gz" \
+            "beacon-${VERSION}-${TARGET}.tar.gz.sha256" \
+            --generate-notes \
+            --title "Beacon ${VERSION}"
