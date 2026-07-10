@@ -1,4 +1,9 @@
-use beacon::{Manager, config::Config, store::Store, versions::version_number};
+use beacon::{
+    Manager,
+    config::Config,
+    store::Store,
+    versions::{manager_for_executable, version_number},
+};
 
 #[test]
 fn parses_versions_from_supported_tool_outputs() {
@@ -51,4 +56,19 @@ fn sqlite_history_is_newest_first_and_prunable() {
     let history = store.history(10).unwrap();
     assert_eq!(history.len(), 1);
     assert_eq!(history[0].summary, "second");
+}
+
+#[test]
+fn manager_detection_resolves_executable_symlinks() {
+    let directory = tempfile::tempdir().unwrap();
+    let target_dir = directory.path().join("homebrew/bin");
+    let link_dir = directory.path().join("usr/local/bin");
+    std::fs::create_dir_all(&target_dir).unwrap();
+    std::fs::create_dir_all(&link_dir).unwrap();
+    let target = target_dir.join("npm");
+    let link = link_dir.join("npm");
+    std::fs::write(&target, "").unwrap();
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+
+    assert_eq!(manager_for_executable(&link), Manager::Homebrew);
 }

@@ -121,6 +121,30 @@ fn report(
     }
 }
 
+fn npm_report(
+    executable: Option<PathBuf>,
+    current: Option<String>,
+    latest: Option<String>,
+) -> ToolReport {
+    let manager = executable
+        .as_deref()
+        .map(manager_for_executable)
+        .unwrap_or(Manager::Unknown);
+    report(
+        "npm",
+        "npm",
+        current,
+        latest,
+        manager,
+        executable,
+        vec![],
+        Some(CommandSpec::new(
+            "npm",
+            ["install", "--global", "npm@latest"],
+        )),
+    )
+}
+
 pub async fn check_all(config: &Config, refresh: bool, ui: &Ui) -> Result<Vec<ToolReport>> {
     let mut reports = Vec::new();
     let brew_available = find_executable("brew").is_some();
@@ -321,19 +345,7 @@ pub async fn check_all(config: &Config, refresh: bool, ui: &Ui) -> Result<Vec<To
         .await
         .ok()
         .and_then(|s| version_number(&s).or(Some(s)));
-        reports.push(report(
-            "npm",
-            "npm",
-            current,
-            latest,
-            Manager::Npm,
-            executable,
-            vec![],
-            Some(CommandSpec::new(
-                "npm",
-                ["install", "--global", "npm@latest"],
-            )),
-        ));
+        reports.push(npm_report(executable, current, latest));
     }
 
     if config.enabled_tools.iter().any(|t| t == "pnpm") {
@@ -434,5 +446,35 @@ mod tests {
 
         assert_eq!(item.status, ToolStatus::Missing);
         assert!(item.action.is_none());
+    }
+
+    #[test]
+    fn npm_report_uses_the_executable_installation_manager() {
+        let item = npm_report(
+            Some(PathBuf::from(
+                "/Users/alice/.local/share/mise/installs/node/26.5.0/bin/npm",
+            )),
+            Some("11.17.0".into()),
+            Some("12.0.0".into()),
+        );
+
+        assert_eq!(item.manager, Manager::Mise);
+        let action = item.action.unwrap();
+        assert_eq!(action.program, "npm");
+        assert_eq!(action.args, ["install", "--global", "npm@latest"]);
+    }
+
+    #[test]
+    fn npm_report_supports_homebrew_and_missing_installations() {
+        let homebrew = npm_report(
+            Some(PathBuf::from("/opt/homebrew/bin/npm")),
+            Some("11.17.0".into()),
+            Some("12.0.0".into()),
+        );
+        let missing = npm_report(None, None, Some("12.0.0".into()));
+
+        assert_eq!(homebrew.manager, Manager::Homebrew);
+        assert_eq!(missing.manager, Manager::Unknown);
+        assert!(missing.action.is_none());
     }
 }

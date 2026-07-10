@@ -125,10 +125,10 @@ pub mod versions {
     use std::path::Path;
 
     pub fn classify_manager(path: &str) -> Manager {
-        if path.contains("/homebrew/") {
-            Manager::Homebrew
-        } else if path.contains("/mise/") {
+        if path.contains("/mise/") {
             Manager::Mise
+        } else if path.contains("/homebrew/") {
+            Manager::Homebrew
         } else if path.contains("/.cargo/") {
             Manager::Rustup
         } else {
@@ -151,7 +151,8 @@ pub mod versions {
     }
 
     pub fn manager_for_executable(path: &Path) -> Manager {
-        classify_manager(&path.to_string_lossy())
+        let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        classify_manager(&resolved.to_string_lossy())
     }
 }
 
