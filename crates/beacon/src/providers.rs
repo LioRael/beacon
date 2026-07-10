@@ -99,6 +99,21 @@ pub enum TargetMode {
     Floating,
 }
 
+impl TargetMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Exact => "exact",
+            Self::Floating => "floating",
+        }
+    }
+}
+
+impl std::fmt::Display for TargetMode {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct UpgradeAction {
     pub manager: ManagerId,

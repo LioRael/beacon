@@ -813,6 +813,7 @@ fn exact_and_floating_verification_follow_confirmed_versions() {
     let expected = ToolVersion::new("2.0.0", Some("2.0.0".into())).unwrap();
     let exact_wrong = ToolVersion::new("2.0.1", Some("2.0.1".into())).unwrap();
     let floating_ok = ToolVersion::new("2.1.0", Some("2.1.0".into())).unwrap();
+    let floating_below_expected = ToolVersion::new("1.5.0", Some("1.5.0".into())).unwrap();
     let compare = |a: &ToolVersion, b: &ToolVersion| {
         Ok(semver::Version::parse(a.display())?.cmp(&semver::Version::parse(b.display())?))
     };
@@ -821,6 +822,17 @@ fn exact_and_floating_verification_follow_confirmed_versions() {
     assert!(verify_versions(TargetMode::Exact, &old, &expected, &exact_wrong, compare).is_err());
     assert!(verify_versions(TargetMode::Floating, &old, &expected, &floating_ok, compare).is_ok());
     assert!(verify_versions(TargetMode::Floating, &old, &expected, &old, compare).is_err());
+    assert!(
+        verify_versions(
+            TargetMode::Floating,
+            &old,
+            &expected,
+            &floating_below_expected,
+            compare
+        )
+        .is_err()
+    );
+    assert!(verify_versions(TargetMode::Floating, &old, &expected, &expected, compare).is_ok());
 }
 
 #[tokio::test]

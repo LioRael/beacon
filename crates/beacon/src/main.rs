@@ -382,7 +382,7 @@ fn select_targets(data: &CheckData, args: &UpgradeArgs, ui: &Ui) -> Result<Vec<P
         .iter()
         .map(|plan| {
             format!(
-                "{}: {} → {} ({}; {:?})",
+                "{}: {} → {} ({}; {})",
                 ui.paint(&plan.id, Style::new().cyan()),
                 plan.current.as_deref().unwrap_or("unknown"),
                 ui.paint(
@@ -637,8 +637,9 @@ async fn run(cli: Cli) -> Result<i32> {
                 if !args.yes
                     && !Confirm::new()
                         .with_prompt(format!(
-                            "Run `{}` ({:?})?",
+                            "Run `{}` → {} ({})?",
                             plan.action.command.display(),
+                            plan.action.expected_version.display(),
                             plan.action.target_mode
                         ))
                         .default(false)
@@ -711,6 +712,17 @@ async fn run(cli: Cli) -> Result<i32> {
                     Ok(result) => result,
                     Err(error) => {
                         let summary = redact(&error.to_string(), home.as_deref());
+                        let recovery = plan
+                            .tool
+                            .as_ref()
+                            .map(providers::recovery_hint)
+                            .unwrap_or_else(|| "Run `brew doctor`.".into());
+                        let detail = format!("upgrade failed: {summary}. {recovery}");
+                        let target = if plan.tool.is_some() {
+                            format!("tool:{}", plan.id)
+                        } else {
+                            format!("inventory:{}", plan.id)
+                        };
                         store.record(
                             "upgrade",
                             &plan.id,
@@ -719,7 +731,7 @@ async fn run(cli: Cli) -> Result<i32> {
                             &plan.source,
                             &plan.updater,
                             "failed",
-                            &summary,
+                            &detail,
                         )?;
                         append_log(
                             &log_path,
@@ -727,19 +739,12 @@ async fn run(cli: Cli) -> Result<i32> {
                                 "{} {} failed: {}",
                                 chrono::Utc::now().to_rfc3339(),
                                 plan.id,
-                                summary
+                                detail
                             ),
                         )?;
-                        let recovery = plan
-                            .tool
-                            .as_ref()
-                            .map(providers::recovery_hint)
-                            .unwrap_or_else(|| "Run `brew doctor`.".into());
-                        batch.errors.push(ErrorDetail::new(
-                            "upgrade_failed",
-                            Some(format!("tool:{}", plan.id)),
-                            format!("upgrade failed. {recovery}"),
-                        ));
+                        batch
+                            .errors
+                            .push(ErrorDetail::new("upgrade_failed", Some(target), detail));
                         break;
                     }
                 };
