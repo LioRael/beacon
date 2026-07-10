@@ -122,6 +122,8 @@ fn partial_check_returns_structured_json_and_exit_two() {
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(2));
+    assert!(output.stderr.is_empty());
+    assert!(!output.stdout.contains(&0x1b));
     let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(value["status"], "partial");
     assert_eq!(value["errors"][0]["code"], "tool_failed");
@@ -140,6 +142,8 @@ fn fatal_json_commands_still_return_the_v2_envelope() {
         .unwrap();
 
     assert_eq!(output.status.code(), Some(1));
+    assert!(output.stderr.is_empty());
+    assert!(!output.stdout.contains(&0x1b));
     let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(value["schema_version"], 2);
     assert_eq!(value["status"], "error");
