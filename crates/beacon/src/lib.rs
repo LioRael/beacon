@@ -218,7 +218,7 @@ pub mod ui {
     use anyhow::Result;
     use console::Style;
     use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
-    use std::{io::IsTerminal, time::Duration};
+    use std::{io::IsTerminal, sync::Mutex, time::Duration};
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum FeedbackMode {
@@ -268,6 +268,7 @@ pub mod ui {
     pub struct Ui {
         mode: FeedbackMode,
         colors: bool,
+        progress: Mutex<Option<ProgressBar>>,
     }
 
     impl Ui {
@@ -277,6 +278,7 @@ pub mod ui {
             Self {
                 mode: FeedbackMode::select(is_tty, json, verbose),
                 colors,
+                progress: Mutex::new(None),
             }
         }
 
@@ -295,35 +297,46 @@ pub mod ui {
             }
         }
 
+        pub(crate) fn start_progress(&self, label: &str) {
+            match self.mode {
+                FeedbackMode::Spinner => {
+                    let bar = ProgressBar::with_draw_target(None, ProgressDrawTarget::stderr());
+                    if let Ok(style) = ProgressStyle::with_template(spinner_template(self.colors)) {
+                        bar.set_style(
+                            style.tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]),
+                        );
+                    }
+                    bar.set_message(label.to_string());
+                    bar.enable_steady_tick(Duration::from_millis(80));
+                    *self.progress.lock().expect("progress mutex poisoned") = Some(bar);
+                }
+                FeedbackMode::Plain => eprintln!("… {label}"),
+                FeedbackMode::Silent | FeedbackMode::Verbose => {}
+            }
+        }
+
+        pub(crate) fn finish_progress(&self) {
+            if let Some(bar) = self
+                .progress
+                .lock()
+                .expect("progress mutex poisoned")
+                .take()
+            {
+                bar.finish_and_clear();
+            }
+        }
+
         pub async fn run_command(
             &self,
             label: &str,
             spec: &CommandSpec,
             seconds: u64,
         ) -> Result<CommandOutput> {
-            let spinner = match self.mode {
-                FeedbackMode::Spinner => {
-                    let bar = ProgressBar::with_draw_target(None, ProgressDrawTarget::stderr());
-                    bar.set_style(
-                        ProgressStyle::with_template(spinner_template(self.colors))?
-                            .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]),
-                    );
-                    bar.set_message(label.to_string());
-                    bar.enable_steady_tick(Duration::from_millis(80));
-                    Some(bar)
-                }
-                FeedbackMode::Plain => {
-                    eprintln!("… {label}");
-                    None
-                }
-                FeedbackMode::Silent | FeedbackMode::Verbose => None,
-            };
+            self.start_progress(label);
             let result =
                 crate::runner::run_with_output(spec, seconds, self.mode == FeedbackMode::Verbose)
                     .await;
-            if let Some(bar) = spinner {
-                bar.finish_and_clear();
-            }
+            self.finish_progress();
             result
         }
     }
