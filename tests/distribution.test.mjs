@@ -103,5 +103,19 @@ test("CI runs distribution, skill, and Formula validation", () => {
 
   assert.match(workflow, /node --test packages\/npm\/test\/\*\.test\.mjs tests\/\*\.test\.mjs/);
   assert.match(workflow, /render-homebrew-formula\.mjs/);
+  assert.match(workflow, /0\.2\.0/);
   assert.match(workflow, /ruby -c/);
+  assert.match(workflow, /verify-release-version\.mjs v0\.2\.0/);
+});
+
+test("README documents the two-layer model and release metadata at 0.2.0", () => {
+  const readme = fs.readFileSync(new URL("../README.md", import.meta.url), "utf8");
+
+  assert.match(readme, /# Beacon 0\.2/);
+  assert.match(readme, /beacon-v0\.2\.0-aarch64-apple-darwin/);
+  assert.match(readme, /schema_version: 2/);
+  assert.match(readme, /docs\/domain-glossary\.md/);
+  assert.match(readme, /docs\/adr\/0001-two-layer-provider-model\.md/);
+  assert.match(readme, /docs\/adr\/0002-schema-and-local-state-v2\.md/);
+  assert.match(readme, /skills\/beacon\/SKILL\.md/);
 });

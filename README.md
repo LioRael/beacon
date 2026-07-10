@@ -62,6 +62,17 @@ Interactive terminals use color and a spinner with the current stage and elapsed
 
 Logs and history redact bearer/basic credentials, common secret assignments, and the absolute home directory. Beacon does not edit project toolchain files, lockfiles, shell configuration, or request administrator privileges.
 
+## Architecture and domain model
+
+Beacon v0.2 uses a two-layer provider model: **ToolAdapter** discovers tools and versions;
+**InstallManager** owns receipts, latest semantics, and update actions. Installation source and
+update manager stay independent fields across human output, JSON, and local history.
+
+- Domain vocabulary: [`docs/domain-glossary.md`](docs/domain-glossary.md)
+- ADR 0001 — two-layer provider model: [`docs/adr/0001-two-layer-provider-model.md`](docs/adr/0001-two-layer-provider-model.md)
+- ADR 0002 — JSON and local-state v2: [`docs/adr/0002-schema-and-local-state-v2.md`](docs/adr/0002-schema-and-local-state-v2.md)
+- Agent Skill (schema v2 contracts): [`skills/beacon/SKILL.md`](skills/beacon/SKILL.md)
+
 ## Development
 
 ```bash
@@ -69,6 +80,7 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 node --test packages/npm/test/*.test.mjs tests/*.test.mjs
+node scripts/verify-release-version.mjs v0.2.0
 ```
 
 ## Distribution setup

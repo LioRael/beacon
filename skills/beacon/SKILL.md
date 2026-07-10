@@ -31,7 +31,15 @@ beacon history --json
 beacon config show --json
 ```
 
-Require `schema_version: 2` and parse the JSON envelope rather than scraping colored terminal output. Traverse `data.tools` and `data.inventories` separately. Treat `installation` and `update` as explicitly nullable. Summarize current, outdated, missing, unmanaged, and failed tools. Preserve `installation.source` separately from `update.manager` in every summary and confirmation. Report missing tools; never pass missing or unmanaged tools to `upgrade`.
+Always prefer `--json` machine output. Require `schema_version: 2` and parse the JSON envelope (`status`, `data`, `errors`). Never scrape colored or human terminal tables for decisions. Traverse `data.tools` and `data.inventories` separately. Treat `installation` and `update` as explicitly nullable.
+
+Summarize current, outdated, missing, unmanaged, and failed tools. Preserve `installation.source` separately from `update.manager` in every summary and confirmation; never collapse them into a single "manager". Report missing tools for diagnosis only. Never pass missing or unmanaged tools to `upgrade`.
+
+Interpret envelope outcomes:
+
+- `status: "ok"` with exit 0 is complete success.
+- `status: "partial"` with exit 2 is valid partial data plus structured, redacted `errors`; report successful items and failures separately.
+- `status: "error"` with exit 1 is fatal; do not invent tool state from human output.
 
 Use `doctor` when the user asks why a tool, version, path, or manager was detected. Use `history` only when prior Beacon activity is relevant.
 
@@ -43,9 +51,11 @@ Show the user:
 
 - Each exact target.
 - Current and latest versions.
-- Detected installation source and update manager.
+- Detected installation source and update manager, kept separate.
 - The exact action Beacon reports.
-- Whether the action has an `exact` or `floating` target mode.
+- Whether the action has an `exact` or `floating` target mode:
+  - `exact`: post-upgrade version must equal the confirmed expected version.
+  - `floating`: manager policy is preserved; post-upgrade version must be newer than the old version and no lower than the confirmed candidate.
 
 Ask for explicit confirmation of the final target set after showing this information. A prior general request such as "update my environment" is not the required final confirmation.
 
@@ -55,7 +65,12 @@ After confirmation, execute exactly:
 beacon upgrade <targets> --yes --json
 ```
 
-Do not add targets, use an untargeted `brew upgrade`, install missing tools through `upgrade`, or retry a failed upgrade without a new diagnosis. Beacon stops at the first failed command or verification; report its recovery guidance and wait for direction.
+Do not add targets, use an untargeted `brew upgrade`, install missing tools through `upgrade`, or retry a failed upgrade without a new diagnosis. Beacon stops at the first failed command or verification. Always parse the JSON envelope afterward:
+
+- If some targets succeeded before the failure, expect `status: "partial"` and exit 2.
+- If no target succeeded, expect `status: "error"` and exit 1.
+
+In both cases report recovery guidance from the structured `errors` field and wait for direction. Do not scrape human terminal output or auto-retry.
 
 ## Stay within scope
 
