@@ -213,7 +213,121 @@ fn config_show_json_uses_the_v2_envelope() {
     assert_eq!(value["schema_version"], 2);
     assert_eq!(value["status"], "ok");
     assert_eq!(value["data"]["schema_version"], 2);
+    assert_eq!(
+        value["data"]["enabled_tools"],
+        serde_json::json!(["rust", "node", "npm", "pnpm", "go", "bun", "deno", "uv"])
+    );
+    assert_eq!(
+        value["data"]["enabled_inventories"],
+        serde_json::json!(["homebrew"])
+    );
     assert!(value["errors"].as_array().unwrap().is_empty());
+}
+
+fn config_path_for(home: &std::path::Path) -> std::path::PathBuf {
+    // Deterministic macOS layout used by directories::ProjectDirs + config::app_dir.
+    // Do not shell out to `beacon config path` here: every CLI entrypoint runs ensure()
+    // and would create a fresh v2 file before fixtures are planted.
+    home.join("Library/Application Support/Beacon/config.toml")
+}
+
+#[test]
+fn cli_migrates_v1_config_with_backup_and_stays_idempotent() {
+    let home = tempfile::tempdir().unwrap();
+    let path = config_path_for(home.path());
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let original = "# preserve\nenabled_tools = [\"homebrew\", \"node\", \"rust\"]\npreferred_install_manager = \"homebrew\"\nhistory_limit = 42\ncustom_key = \"keep\"\n";
+    std::fs::write(&path, original).unwrap();
+
+    let first = Command::new(env!("CARGO_BIN_EXE_beacon"))
+        .args(["config", "show", "--json"])
+        .env("HOME", home.path())
+        .output()
+        .unwrap();
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&first.stdout).unwrap();
+    assert_eq!(value["data"]["schema_version"], 2);
+    assert_eq!(value["data"]["enabled_tools"], serde_json::json!(["node", "rust"]));
+    assert_eq!(
+        value["data"]["enabled_inventories"],
+        serde_json::json!(["homebrew"])
+    );
+    assert_eq!(value["data"]["history_limit"], 42);
+
+    let migrated = std::fs::read_to_string(&path).unwrap();
+    let backup_path = path.with_file_name("config.toml.v1.bak");
+    let backup = std::fs::read_to_string(&backup_path).unwrap();
+    assert!(migrated.contains("# preserve"));
+    assert!(migrated.contains("custom_key = \"keep\""));
+    assert!(migrated.contains("history_limit = 42"));
+    assert!(migrated.contains("schema_version = 2"));
+    assert!(migrated.contains("enabled_inventories = [\"homebrew\"]"));
+    assert!(!migrated.contains("preferred_install_manager"));
+    assert!(!value["data"]["enabled_tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|tool| tool == "homebrew"));
+    assert_eq!(backup, original);
+    assert!(!path.with_file_name("config.toml.tmp").exists());
+    assert!(!path.with_file_name("config.toml.v1.bak.tmp").exists());
+
+    let second = Command::new(env!("CARGO_BIN_EXE_beacon"))
+        .args(["config", "show", "--json"])
+        .env("HOME", home.path())
+        .output()
+        .unwrap();
+    assert!(second.status.success());
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), migrated);
+    assert_eq!(std::fs::read_to_string(&backup_path).unwrap(), backup);
+}
+
+#[test]
+fn cli_rejects_future_config_schema_without_rewrite() {
+    let home = tempfile::tempdir().unwrap();
+    let path = config_path_for(home.path());
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let original = "schema_version = 3\nenabled_tools = [\"node\"]\n";
+    std::fs::write(&path, original).unwrap();
+
+    let json = Command::new(env!("CARGO_BIN_EXE_beacon"))
+        .args(["config", "show", "--json"])
+        .env("HOME", home.path())
+        .output()
+        .unwrap();
+    assert_eq!(json.status.code(), Some(1));
+    assert!(json.stderr.is_empty());
+    let value: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    assert_eq!(value["schema_version"], 2);
+    assert_eq!(value["status"], "error");
+    assert_eq!(value["errors"][0]["code"], "fatal_error");
+    assert!(
+        value["errors"][0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("unsupported Beacon config schema version 3")
+    );
+
+    let human = Command::new(env!("CARGO_BIN_EXE_beacon"))
+        .args(["config", "show"])
+        .env("HOME", home.path())
+        .output()
+        .unwrap();
+    assert_eq!(human.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&human.stderr);
+    assert!(
+        stderr.contains("unsupported Beacon config schema version 3"),
+        "stderr={stderr}"
+    );
+
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+    assert!(!path.with_file_name("config.toml.v1.bak").exists());
+    assert!(!path.with_file_name("config.toml.tmp").exists());
+    assert!(!path.with_file_name("config.toml.v1.bak.tmp").exists());
 }
 
 #[test]
