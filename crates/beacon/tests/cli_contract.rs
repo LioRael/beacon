@@ -1,5 +1,14 @@
 use std::process::Command;
 
+#[cfg(unix)]
+fn write_executable(path: &std::path::Path, body: &str) {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, body).unwrap();
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
 #[test]
 fn exposes_the_v01_command_surface() {
     let output = Command::new(env!("CARGO_BIN_EXE_beacon"))
@@ -150,4 +159,170 @@ fn fatal_json_commands_still_return_the_v2_envelope() {
     assert!(value["data"].is_null());
     assert_eq!(value["errors"][0]["code"], "fatal_error");
     assert!(value["errors"][0]["target"].is_null());
+}
+
+#[test]
+fn check_json_reports_npm_global_pnpm_with_an_exact_pinned_action() {
+    let home = tempfile::tempdir().unwrap();
+    let fixture = tempfile::tempdir().unwrap();
+    let bin = fixture.path().join("node_modules/.bin");
+    write_executable(&bin.join("pnpm"), "#!/bin/sh\nprintf '10.0.0\\n'\n");
+    write_executable(
+        &bin.join("npm"),
+        "#!/bin/sh\nif [ \"$1\" = prefix ]; then printf '/fixture/npm-global\\n'; else printf '10.1.0\\n'; fi\n",
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_beacon"))
+        .args(["check", "--json"])
+        .env("HOME", home.path())
+        .env("PATH", &bin)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let pnpm = value["data"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["id"] == "pnpm")
+        .unwrap();
+    assert_eq!(pnpm["installation"]["source"], "npm-global");
+    assert_eq!(pnpm["update"]["manager"], "npm");
+    assert_eq!(pnpm["update"]["action"]["target_mode"], "exact");
+    assert_eq!(
+        pnpm["update"]["action"]["command"]["args"],
+        serde_json::json!(["install", "--global", "pnpm@10.1.0"])
+    );
+}
+
+#[test]
+fn project_package_manager_pin_keeps_corepack_pnpm_unmanaged_and_untouched() {
+    let home = tempfile::tempdir().unwrap();
+    let fixture = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let bin = fixture.path().join("corepack/shims");
+    write_executable(&bin.join("pnpm"), "#!/bin/sh\nprintf '10.0.0\\n'\n");
+    write_executable(&bin.join("corepack"), "#!/bin/sh\nprintf '0.31.0\\n'\n");
+    let package_json = project.path().join("package.json");
+    let original = "{\n  \"packageManager\": \"pnpm@10.0.0\"\n}\n";
+    std::fs::write(&package_json, original).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_beacon"))
+        .args(["check", "--json"])
+        .current_dir(project.path())
+        .env("HOME", home.path())
+        .env("PATH", &bin)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let pnpm = value["data"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["id"] == "pnpm")
+        .unwrap();
+    assert_eq!(pnpm["status"], "unmanaged");
+    assert_eq!(pnpm["installation"]["source"], "corepack");
+    assert!(pnpm["update"].is_null());
+    assert_eq!(std::fs::read_to_string(package_json).unwrap(), original);
+}
+
+#[test]
+fn ancestor_project_mise_selector_keeps_node_unmanaged_and_untouched() {
+    let home = tempfile::tempdir().unwrap();
+    let fixture = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let bin = fixture.path().join("mise/installs/node/22/bin");
+    write_executable(&bin.join("node"), "#!/bin/sh\nprintf 'v22.0.0\\n'\n");
+    write_executable(
+        &bin.join("mise"),
+        &format!(
+            "#!/bin/sh\nprintf '{{\"node\":[{{\"version\":\"22.0.0\",\"requested_version\":\"lts\",\"install_path\":\"{}\"}}]}}\\n'\n",
+            fixture.path().join("mise/installs/node/22").display()
+        ),
+    );
+    let config = project.path().join(".mise.toml");
+    let original = "[tools]\nnode = \"lts\"\n";
+    std::fs::write(&config, original).unwrap();
+    let nested = project.path().join("packages/app");
+    std::fs::create_dir_all(&nested).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_beacon"))
+        .args(["check", "--json"])
+        .current_dir(nested)
+        .env("HOME", home.path())
+        .env("PATH", &bin)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let node = value["data"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["id"] == "node")
+        .unwrap();
+    assert_eq!(node["status"], "unmanaged");
+    assert_eq!(node["installation"]["source"], "mise");
+    assert!(node["update"].is_null());
+    assert_eq!(std::fs::read_to_string(config).unwrap(), original);
+}
+
+#[test]
+fn global_mise_pnpm_preserves_selector_in_latest_and_upgrade_action() {
+    let home = tempfile::tempdir().unwrap();
+    let fixture = tempfile::tempdir().unwrap();
+    let bin = fixture.path().join("mise/installs/pnpm/10/bin");
+    write_executable(&bin.join("pnpm"), "#!/bin/sh\nprintf '10.0.0\\n'\n");
+    write_executable(
+        &bin.join("mise"),
+        &format!(
+            "#!/bin/sh\nif [ \"$1\" = ls ]; then printf '{{\"pnpm\":[{{\"version\":\"10.0.0\",\"requested_version\":\"lts\",\"install_path\":\"{}\"}}]}}\\n'; else printf '10.1.0\\n'; fi\n",
+            fixture.path().join("mise/installs/pnpm/10").display()
+        ),
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_beacon"))
+        .args(["check", "--json"])
+        .env("HOME", home.path())
+        .env("PATH", &bin)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let pnpm = value["data"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["id"] == "pnpm")
+        .unwrap();
+    assert_eq!(pnpm["status"], "outdated");
+    assert_eq!(pnpm["installation"]["source"], "mise");
+    assert_eq!(pnpm["update"]["manager"], "mise");
+    assert_eq!(pnpm["update"]["action"]["target_mode"], "floating");
+    assert_eq!(
+        pnpm["update"]["action"]["command"]["args"],
+        serde_json::json!(["use", "-g", "pnpm@lts"])
+    );
 }

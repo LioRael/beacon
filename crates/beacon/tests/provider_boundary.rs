@@ -319,6 +319,175 @@ fn provider_registries_are_compile_time_built_ins() {
 }
 
 #[test]
+fn pnpm_supported_channels_choose_matching_source_updater_and_action() {
+    struct Case {
+        manager: &'static str,
+        executable: &'static str,
+        evidence: Vec<ManagerEvidence>,
+        source: &'static str,
+        command: CommandSpec,
+        mode: TargetMode,
+    }
+
+    let cases = [
+        Case {
+            manager: "homebrew",
+            executable: "/opt/homebrew/bin/pnpm",
+            evidence: vec![ManagerEvidence {
+                kind: "receipt:formula".into(),
+                value: "pnpm 10.0.0 /opt/homebrew/bin/pnpm /opt/homebrew/opt/pnpm".into(),
+            }],
+            source: "homebrew",
+            command: CommandSpec::new("brew", ["upgrade", "--formula", "pnpm"]),
+            mode: TargetMode::Floating,
+        },
+        Case {
+            manager: "mise",
+            executable: "/Users/alice/.local/share/mise/installs/pnpm/10/bin/pnpm",
+            evidence: vec![
+                ManagerEvidence {
+                    kind: "receipt".into(),
+                    value: "pnpm /Users/alice/.local/share/mise/installs/pnpm/10/bin/pnpm".into(),
+                },
+                ManagerEvidence {
+                    kind: "selector:pnpm".into(),
+                    value: "lts".into(),
+                },
+            ],
+            source: "mise",
+            command: CommandSpec::new("mise", ["use", "-g", "pnpm@lts"]),
+            mode: TargetMode::Floating,
+        },
+        Case {
+            manager: "npm",
+            executable: "/Users/alice/.npm-global/lib/node_modules/pnpm/bin/pnpm.cjs",
+            evidence: vec![],
+            source: "npm-global",
+            command: CommandSpec::new("npm", ["install", "--global", "pnpm@10.1.0"]),
+            mode: TargetMode::Exact,
+        },
+        Case {
+            manager: "corepack",
+            executable: "/Users/alice/.cache/node/corepack/shims/pnpm",
+            evidence: vec![],
+            source: "corepack",
+            command: CommandSpec::new("corepack", ["prepare", "pnpm@10.1.0", "--activate"]),
+            mode: TargetMode::Exact,
+        },
+    ];
+
+    for case in cases {
+        let manager = install_manager_registry()
+            .iter()
+            .find(|manager| manager.id().as_str() == case.manager)
+            .unwrap();
+        let tool = beacon::providers::DetectedTool {
+            id: ToolId::new("pnpm").unwrap(),
+            executable: case.executable.into(),
+            version: ToolVersion::new("10.0.0", Some("10.0.0".into())).unwrap(),
+        };
+        let snapshot = ManagerSnapshot {
+            manager: manager.id(),
+            evidence: case.evidence,
+        };
+        let claims = manager.claim(&tool, &snapshot);
+        let action = manager
+            .upgrade(
+                &tool,
+                &ToolVersion::new("10.1.0", Some("10.1.0".into())).unwrap(),
+                &snapshot,
+            )
+            .unwrap();
+
+        assert_eq!(claims.source.unwrap().source.as_str(), case.source);
+        assert_eq!(claims.updater.unwrap().manager.as_str(), case.manager);
+        assert_eq!(action.command, case.command);
+        assert_eq!(action.target_mode, case.mode);
+    }
+}
+
+#[test]
+fn project_policy_evidence_makes_node_ecosystem_claims_unmanaged() {
+    for manager_id in ["mise", "npm", "corepack"] {
+        let manager = install_manager_registry()
+            .iter()
+            .find(|manager| manager.id().as_str() == manager_id)
+            .unwrap();
+        let executable = match manager_id {
+            "mise" => "/Users/alice/.local/share/mise/installs/pnpm/10/bin/pnpm",
+            "npm" => "/Users/alice/.npm-global/lib/node_modules/pnpm/bin/pnpm.cjs",
+            "corepack" => "/Users/alice/.cache/node/corepack/shims/pnpm",
+            _ => unreachable!(),
+        };
+        let tool = beacon::providers::DetectedTool {
+            id: ToolId::new("pnpm").unwrap(),
+            executable: executable.into(),
+            version: ToolVersion::new("10.0.0", Some("10.0.0".into())).unwrap(),
+        };
+        let mut evidence = vec![ManagerEvidence {
+            kind: "project-policy:pnpm".into(),
+            value: "project configuration owns pnpm selection".into(),
+        }];
+        if manager_id == "mise" {
+            evidence.push(ManagerEvidence {
+                kind: "receipt".into(),
+                value: format!("pnpm {executable}"),
+            });
+        }
+        let snapshot = ManagerSnapshot {
+            manager: manager.id(),
+            evidence,
+        };
+
+        let claims = manager.claim(&tool, &snapshot);
+
+        assert!(
+            claims.source.is_some(),
+            "{manager_id} should remain diagnostic"
+        );
+        assert!(
+            claims.updater.is_none(),
+            "{manager_id} must not edit project policy"
+        );
+    }
+}
+
+#[test]
+fn corepack_pnpm_inside_a_mise_node_runtime_is_not_claimed_as_mise_pnpm() {
+    let tool = beacon::providers::DetectedTool {
+        id: ToolId::new("pnpm").unwrap(),
+        executable:
+            "/Users/alice/.local/share/mise/installs/node/22/lib/node_modules/corepack/dist/pnpm.js"
+                .into(),
+        version: ToolVersion::new("10.0.0", Some("10.0.0".into())).unwrap(),
+    };
+    let claims = install_manager_registry().iter().filter_map(|manager| {
+        let evidence = if manager.id().as_str() == "mise" {
+            vec![ManagerEvidence {
+                kind: "receipt".into(),
+                value: "node /Users/alice/.local/share/mise/installs/node/22/bin/node".into(),
+            }]
+        } else {
+            vec![]
+        };
+        let claims = manager.claim(
+            &tool,
+            &ManagerSnapshot {
+                manager: manager.id(),
+                evidence,
+            },
+        );
+        (claims.source.is_some() || claims.updater.is_some()).then_some(claims)
+    });
+
+    let resolved = resolve_claims(claims);
+
+    assert_eq!(resolved.source.unwrap().source.as_str(), "corepack");
+    assert_eq!(resolved.updater.unwrap().manager.as_str(), "corepack");
+    assert!(resolved.conflicts.is_empty());
+}
+
+#[test]
 fn claim_resolution_ranks_evidence_and_refuses_equal_top_claims() {
     let path = ManagerClaims {
         source: Some(SourceClaim {
