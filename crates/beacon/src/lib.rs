@@ -442,9 +442,15 @@ pub mod config {
         path::{Path, PathBuf},
     };
 
+    fn missing_schema_version() -> u8 {
+        1
+    }
+
     #[derive(Debug, Clone, Serialize, Deserialize)]
     #[serde(default)]
     pub struct Config {
+        /// Missing keys deserialize as 1 so unmigrated v1 files are not mistaken for v2.
+        #[serde(default = "missing_schema_version")]
         pub schema_version: u8,
         pub enabled_tools: Vec<String>,
         pub enabled_inventories: Vec<String>,
@@ -492,13 +498,11 @@ pub mod config {
         }
         let config: Config =
             toml::from_str(&fs::read_to_string(path)?).context("invalid Beacon config")?;
-        if config.schema_version > 2 {
-            bail!(
-                "unsupported Beacon config schema version {}",
-                config.schema_version
-            );
+        match config.schema_version {
+            2 => Ok(config),
+            version if version > 2 => bail!("unsupported Beacon config schema version {version}"),
+            version => bail!("Beacon config schema version {version} requires migration"),
         }
-        Ok(config)
     }
     pub fn load() -> Result<Config> {
         load_from(&path()?)
@@ -512,7 +516,11 @@ pub mod config {
     }
 
     fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
-        let temporary = path.with_extension("toml.tmp");
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .context("config path has no file name")?;
+        let temporary = path.with_file_name(format!("{file_name}.tmp"));
         fs::write(&temporary, bytes)?;
         fs::rename(temporary, path)?;
         Ok(())
@@ -537,7 +545,7 @@ pub mod config {
 
         let backup = path.with_file_name("config.toml.v1.bak");
         if !backup.exists() {
-            fs::write(&backup, source)?;
+            atomic_write(&backup, source.as_bytes())?;
         }
         let mut tools = Array::new();
         let mut homebrew_was_enabled = false;
