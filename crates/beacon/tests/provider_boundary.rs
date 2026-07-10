@@ -26,6 +26,9 @@ struct ProviderFakeExecutor {
 #[derive(Default)]
 struct RustupFakeExecutor;
 
+struct MismatchedRustupExecutor;
+struct FailingRustupExecutor;
+
 #[derive(Default)]
 struct SharedMiseExecutor {
     calls: Mutex<Vec<CommandSpec>>,
@@ -47,7 +50,7 @@ impl CommandExecutor for SharedMiseExecutor {
                 "go version go1.22.0 darwin/arm64\n"
             }
             ("mise", args) if args == ["ls", "--json"] => {
-                r#"{"node":[{"version":"20"}],"go":[{"version":"1.22"}]}"#
+                r#"{"node":[{"version":"20","requested_version":"20","install_path":"/fixture/mise/installs/node/20"}],"go":[{"version":"1.23","requested_version":"latest","install_path":"/fixture/mise/installs/go/1.23"},{"version":"1.22","requested_version":"1.22","install_path":"/fixture/mise/installs/go/1.22"}]}"#
             }
             ("mise", args) if args == ["latest", "node@20"] => "20.1.0\n",
             ("mise", args) if args == ["latest", "go@1.22"] => "1.22.1\n",
@@ -67,10 +70,58 @@ impl CommandExecutor for RustupFakeExecutor {
             [show, active] if show == "show" && active == "active-toolchain" => {
                 "stable-aarch64-apple-darwin (default)\n"
             }
+            [which, rustc, toolchain, channel]
+                if which == "which"
+                    && rustc == "rustc"
+                    && toolchain == "--toolchain"
+                    && channel == "stable-aarch64-apple-darwin" =>
+            {
+                "/Users/alice/.rustup/toolchains/stable-aarch64-apple-darwin/bin/rustc\n"
+            }
             [check] if check == "check" => {
                 "stable-aarch64-apple-darwin - Update available : 1.80.0 -> 1.81.0\n"
             }
             _ => anyhow::bail!("unexpected rustup command: {:?}", command.args),
+        };
+        Ok(CommandOutput {
+            stdout: stdout.into(),
+            stderr: String::new(),
+        })
+    }
+}
+
+#[async_trait]
+impl CommandExecutor for MismatchedRustupExecutor {
+    async fn execute(&self, command: &CommandSpec, _timeout_seconds: u64) -> Result<CommandOutput> {
+        let stdout = match (command.program.as_str(), command.args.as_slice()) {
+            ("/usr/bin/which", args) if args == ["rustc"] => "/Users/alice/.cargo/bin/rustc\n",
+            ("/Users/alice/.cargo/bin/rustc", args) if args == ["--version"] => {
+                "rustc 1.80.0 (fixture)\n"
+            }
+            ("/usr/bin/which", _) => anyhow::bail!("manager unavailable"),
+            _ => anyhow::bail!("unexpected command: {} {:?}", command.program, command.args),
+        };
+        Ok(CommandOutput {
+            stdout: stdout.into(),
+            stderr: String::new(),
+        })
+    }
+}
+
+#[async_trait]
+impl CommandExecutor for FailingRustupExecutor {
+    async fn execute(&self, command: &CommandSpec, _timeout_seconds: u64) -> Result<CommandOutput> {
+        let stdout = match (command.program.as_str(), command.args.as_slice()) {
+            ("/usr/bin/which", args) if args == ["rustc"] => "/Users/alice/.cargo/bin/rustc\n",
+            ("/Users/alice/.cargo/bin/rustc", args) if args == ["--version"] => {
+                "rustc 1.80.0 (fixture)\n"
+            }
+            ("/usr/bin/which", args) if args == ["rustup"] => "/fixture/bin/rustup\n",
+            ("rustup", args) if args == ["show", "active-toolchain"] => {
+                anyhow::bail!("rustup state unavailable")
+            }
+            ("/usr/bin/which", _) => anyhow::bail!("manager unavailable"),
+            _ => anyhow::bail!("unexpected command: {} {:?}", command.program, command.args),
         };
         Ok(CommandOutput {
             stdout: stdout.into(),
@@ -265,6 +316,55 @@ async fn shared_manager_snapshot_runs_once_and_preserves_mise_selectors() {
     assert_eq!(
         node.update.as_ref().unwrap().action.command,
         CommandSpec::new("mise", ["use", "-g", "node@20"])
+    );
+    let go = reports
+        .tools
+        .iter()
+        .find(|report| report.id == "go")
+        .unwrap();
+    assert_eq!(
+        go.installation
+            .as_ref()
+            .unwrap()
+            .source
+            .as_ref()
+            .unwrap()
+            .as_str(),
+        "mise"
+    );
+    assert_eq!(
+        go.update.as_ref().unwrap().action.command,
+        CommandSpec::new("mise", ["use", "-g", "go@1.22"])
+    );
+}
+
+#[test]
+fn homebrew_go_action_always_targets_the_formula() {
+    let manager = install_manager_registry()
+        .iter()
+        .find(|manager| manager.id().as_str() == "homebrew")
+        .unwrap();
+    let tool = beacon::providers::DetectedTool {
+        id: ToolId::new("go").unwrap(),
+        executable: "/opt/homebrew/bin/go".into(),
+        version: ToolVersion::new("go1.22.0", Some("1.22.0".into())).unwrap(),
+    };
+    let snapshot = ManagerSnapshot {
+        manager: ManagerId::new("homebrew").unwrap(),
+        evidence: vec![ManagerEvidence {
+            kind: "receipt:formula".into(),
+            value: "go 1.22.0 /opt/homebrew/bin/go /opt/homebrew/opt/go".into(),
+        }],
+    };
+    let latest = ToolVersion::new("1.23.0", Some("1.23.0".into())).unwrap();
+
+    let claims = manager.claim(&tool, &snapshot);
+    let action = manager.upgrade(&tool, &latest, &snapshot).unwrap();
+
+    assert_eq!(claims.updater.unwrap().manager.as_str(), "homebrew");
+    assert_eq!(
+        action.command,
+        CommandSpec::new("brew", ["upgrade", "--formula", "go"])
     );
 }
 
@@ -660,5 +760,53 @@ async fn rustup_manager_retains_the_active_channel_for_latest_and_upgrade() {
     assert_eq!(
         action.command,
         CommandSpec::new("rustup", ["update", "stable-aarch64-apple-darwin"])
+    );
+}
+
+#[tokio::test]
+async fn rust_is_unmanaged_when_active_rustc_is_not_the_active_rustup_channels_binary() {
+    let executor = MismatchedRustupExecutor;
+    let progress = RecordingProgress::default();
+    let context = ProviderContext::new(&executor, &progress, 5);
+    let config = Config {
+        enabled_tools: vec!["rust".into()],
+        enabled_inventories: vec![],
+        ..Config::default()
+    };
+
+    let reports = check_all_with_context(&config, false, &context)
+        .await
+        .unwrap();
+    let rust = &reports.tools[0];
+
+    assert_eq!(rust.status, beacon::ToolStatus::Unmanaged);
+    assert!(rust.installation.is_some());
+    assert!(rust.update.is_none());
+}
+
+#[tokio::test]
+async fn rustup_query_failure_is_reported_as_failed_instead_of_unmanaged() {
+    let executor = FailingRustupExecutor;
+    let progress = RecordingProgress::default();
+    let context = ProviderContext::new(&executor, &progress, 5);
+    let config = Config {
+        enabled_tools: vec!["rust".into()],
+        enabled_inventories: vec![],
+        ..Config::default()
+    };
+
+    let reports = check_all_with_context(&config, false, &context)
+        .await
+        .unwrap();
+    let rust = &reports.tools[0];
+
+    assert_eq!(rust.status, beacon::ToolStatus::Failed);
+    assert!(rust.installation.is_some());
+    assert!(rust.update.is_none());
+    assert!(
+        rust.detail
+            .as_deref()
+            .unwrap()
+            .contains("manager query failed")
     );
 }

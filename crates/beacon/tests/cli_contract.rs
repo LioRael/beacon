@@ -162,6 +162,175 @@ fn fatal_json_commands_still_return_the_v2_envelope() {
 }
 
 #[test]
+fn check_json_reports_the_active_rustup_channel_without_reading_project_policy() {
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let bin = home.path().join(".cargo/bin");
+    let rustc = bin.join("rustc");
+    write_executable(
+        &bin.join("rustup"),
+        &format!(
+            "#!/bin/sh\nif [ \"${{0##*/}}\" = rustc ]; then printf 'rustc 1.80.0 (fixture)\\n'; exit; fi\ncase \"$1 $2\" in\n  'show active-toolchain') printf 'stable-aarch64-apple-darwin (default)\\n' ;;\n  'which rustc') printf '{}\\n' ;;\n  'check ') printf 'stable-aarch64-apple-darwin - Update available : 1.80.0 -> 1.81.0\\n' ;;\nesac\n",
+            rustc.display()
+        ),
+    );
+    std::fs::hard_link(bin.join("rustup"), &rustc).unwrap();
+    let policy = project.path().join("rust-toolchain.toml");
+    let original = "[toolchain]\nchannel = \"nightly\"\n";
+    std::fs::write(&policy, original).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_beacon"))
+        .args(["check", "--json"])
+        .current_dir(project.path())
+        .env("HOME", home.path())
+        .env("PATH", &bin)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let rust = value["data"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["id"] == "rust")
+        .unwrap();
+    assert_eq!(rust["status"], "outdated");
+    assert_eq!(rust["update"]["manager"], "rustup");
+    assert_eq!(
+        rust["update"]["action"]["command"]["args"],
+        serde_json::json!(["update", "stable-aarch64-apple-darwin"])
+    );
+    assert_eq!(std::fs::read_to_string(policy).unwrap(), original);
+}
+
+#[test]
+fn check_json_reports_homebrew_go_with_an_explicit_formula_action() {
+    let home = tempfile::tempdir().unwrap();
+    let prefix = tempfile::tempdir().unwrap();
+    let bin = prefix.path().join("bin");
+    write_executable(
+        &bin.join("go"),
+        "#!/bin/sh\nprintf 'go version go1.22.0 darwin/arm64\\n'\n",
+    );
+    write_executable(
+        &bin.join("brew"),
+        &format!(
+            "#!/bin/sh\ncase \"$1 $2 $3\" in\n  'list --formula --versions') printf 'go 1.22.0\\n' ;;\n  'list --cask --versions') : ;;\n  '--prefix  ') printf '{}\\n' ;;\n  'info --json=v2 go') printf '{{\"formulae\":[{{\"versions\":{{\"stable\":\"1.23.0\"}}}}]}}\\n' ;;\n  'outdated --json=v2 ') printf '{{\"formulae\":[],\"casks\":[]}}\\n' ;;\nesac\n",
+            prefix.path().display()
+        ),
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_beacon"))
+        .args(["check", "--json"])
+        .env("HOME", home.path())
+        .env("PATH", &bin)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let go = value["data"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["id"] == "go")
+        .unwrap();
+    assert_eq!(go["installation"]["source"], "homebrew");
+    assert_eq!(go["update"]["manager"], "homebrew");
+    assert_eq!(
+        go["update"]["action"]["command"]["args"],
+        serde_json::json!(["upgrade", "--formula", "go"])
+    );
+}
+
+#[test]
+fn check_json_preserves_the_active_global_mise_go_selector() {
+    let home = tempfile::tempdir().unwrap();
+    let fixture = tempfile::tempdir().unwrap();
+    let install = fixture.path().join("mise/installs/go/1.22");
+    let bin = install.join("bin");
+    write_executable(
+        &bin.join("go"),
+        "#!/bin/sh\nprintf 'go version go1.22.0 darwin/arm64\\n'\n",
+    );
+    write_executable(
+        &bin.join("mise"),
+        &format!(
+            "#!/bin/sh\ncase \"$1 $2\" in\n  'ls --json') printf '{{\"go\":[{{\"version\":\"1.22.0\",\"requested_version\":\"1.22\",\"install_path\":\"{}\"}}]}}\\n' ;;\n  'latest go@1.22') printf '1.22.1\\n' ;;\nesac\n",
+            install.display()
+        ),
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_beacon"))
+        .args(["check", "--json"])
+        .env("HOME", home.path())
+        .env("PATH", &bin)
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let go = value["data"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["id"] == "go")
+        .unwrap();
+    assert_eq!(go["installation"]["source"], "mise");
+    assert_eq!(go["update"]["manager"], "mise");
+    assert_eq!(
+        go["update"]["action"]["command"]["args"],
+        serde_json::json!(["use", "-g", "go@1.22"])
+    );
+}
+
+#[test]
+fn check_json_reports_rustup_query_failure_as_a_partial_schema_v2_result() {
+    let home = tempfile::tempdir().unwrap();
+    let bin = home.path().join(".cargo/bin");
+    write_executable(
+        &bin.join("rustc"),
+        "#!/bin/sh\nprintf 'rustc 1.80.0 (fixture)\\n'\n",
+    );
+    write_executable(&bin.join("rustup"), "#!/bin/sh\nexit 1\n");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_beacon"))
+        .args(["check", "--json"])
+        .env("HOME", home.path())
+        .env("PATH", &bin)
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stderr.is_empty());
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["schema_version"], 2);
+    assert_eq!(value["status"], "partial");
+    let rust = value["data"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["id"] == "rust")
+        .unwrap();
+    assert_eq!(rust["status"], "failed");
+    assert!(rust["installation"].is_object());
+    assert!(rust["update"].is_null());
+    assert_eq!(value["errors"][0]["code"], "tool_failed");
+    assert_eq!(value["errors"][0]["target"], "tool:rust");
+}
+
+#[test]
 fn check_json_reports_npm_global_pnpm_with_an_exact_pinned_action() {
     let home = tempfile::tempdir().unwrap();
     let fixture = tempfile::tempdir().unwrap();
