@@ -9,6 +9,7 @@
 - **Inventory**: installed items that are not logical PATH tools. Homebrew formulae and casks use qualified IDs such as `brew:formula:wget` and `brew:cask:firefox`.
 - **Exact action**: verification requires the resulting version to equal the confirmed expected version.
 - **Floating action**: manager policy is preserved; verification requires a newer result no lower than the confirmed candidate.
+- **Rolling action**: a moving channel is preserved; verification requires the observed revision to change, while allowing the channel head to advance after confirmation.
 - **Unmanaged**: the tool is installed but no unique safe updater exists. Beacon diagnoses it and emits no action.
 - **Missing**: the tool is not present on `PATH`. Beacon reports it without latest lookup or upgrade action.
 - **Partial result**: machine output with valid data and structured errors (`status: "partial"`, exit 2). Failures stay isolated; agents must not invent missing fields from human terminal output.

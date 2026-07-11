@@ -33,11 +33,12 @@ test("skill excludes missing and unmanaged from upgrade targets", () => {
   assert.match(skill, /status is `outdated` and whose `action` is present/);
 });
 
-test("skill understands exact and floating verification modes", () => {
-  assert.match(skill, /`exact` or `floating` target mode/);
+test("skill understands exact, floating, and rolling verification modes", () => {
+  assert.match(skill, /`exact`, `floating`, or `rolling` target mode/);
   assert.match(skill, /`exact`:.*equal the confirmed expected version/i);
   assert.match(skill, /`floating`:.*newer than the old version/i);
   assert.match(skill, /no lower than the confirmed candidate/i);
+  assert.match(skill, /`rolling`:.*observed revision must change/i);
 });
 
 test("skill interprets inspect envelope outcomes without scraping human terminal output", () => {

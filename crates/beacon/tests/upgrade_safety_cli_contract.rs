@@ -157,7 +157,7 @@ VERSION_FILE="{version}"
 LOG_FILE="{log}"
 MODE="{mode}"
 case "$1" in
-  --version)
+  --version|--revision)
     read ver < "$VERSION_FILE"
     printf '%s\n' "$ver"
     ;;
@@ -187,6 +187,46 @@ esac
             "#!/bin/sh\nprintf 'https://github.com/oven-sh/bun/releases/tag/{latest_tag}\\n'\n"
         ),
     );
+    write_config(home.path(), &["bun"]);
+    BunFixture { home, bin, log }
+}
+
+fn bun_canary_fixture() -> BunFixture {
+    let home = tempfile::tempdir().unwrap();
+    let bin = home.path().join(".bun/bin");
+    let state = home.path().join("fixture-state");
+    std::fs::create_dir_all(&state).unwrap();
+    let log = state.join("upgrade.log");
+    let version = state.join("version");
+    std::fs::write(&version, "1.4.0-canary.1+91675d0ba\n").unwrap();
+    write_executable(
+        &bin.join("bun"),
+        &format!(
+            r#"#!/bin/sh
+VERSION_FILE="{version}"
+LOG_FILE="{log}"
+case "$1" in
+  --revision)
+    read ver < "$VERSION_FILE"
+    printf '%s\n' "$ver"
+    ;;
+  upgrade)
+    [ "$2" = "--canary" ] || exit 64
+    printf 'upgrade --canary\n' >> "$LOG_FILE"
+    printf '1.4.0-canary.1+abcdef123\n' > "$VERSION_FILE"
+    ;;
+  *) exit 64 ;;
+esac
+"#,
+            version = version.display(),
+            log = log.display(),
+        ),
+    );
+    write_executable(
+        &bin.join("git"),
+        "#!/bin/sh\nprintf '0d4b4c494243cf73bf704971dcc0711c5882a8aa\\trefs/tags/canary\\n'\n",
+    );
+    write_executable(&bin.join("curl"), "#!/bin/sh\nexit 64\n");
     write_config(home.path(), &["bun"]);
     BunFixture { home, bin, log }
 }
@@ -388,6 +428,28 @@ fn floating_upgrade_succeeds_when_result_is_newer_and_not_below_expected() {
 }
 
 #[test]
+fn rolling_canary_upgrade_accepts_a_newer_revision_than_the_planned_tag() {
+    let fixture = bun_canary_fixture();
+    let (code, value) = upgrade_json(fixture.home.path(), &fixture.bin, &["bun"]);
+
+    assert_eq!(code, 0, "{value}");
+    assert_eq!(value["status"], "ok");
+    assert_eq!(value["data"][0]["tool"], "bun");
+    assert_eq!(value["data"][0]["status"], "success");
+    assert_eq!(value["data"][0]["old_version"], "1.4.0-canary.1+91675d0ba");
+    assert_eq!(value["data"][0]["new_version"], "1.4.0-canary.1+abcdef123");
+    assert_eq!(value["data"][0]["action"]["target_mode"], "rolling");
+    assert_eq!(
+        value["data"][0]["action"]["command"]["args"],
+        serde_json::json!(["upgrade", "--canary"])
+    );
+    assert_eq!(
+        std::fs::read_to_string(&fixture.log).unwrap(),
+        "upgrade --canary\n"
+    );
+}
+
+#[test]
 fn floating_upgrade_fails_when_result_is_not_newer() {
     let fixture = bun_fixture("floating-noop");
     let (code, value) = upgrade_json(fixture.home.path(), &fixture.bin, &["bun"]);
@@ -495,7 +557,7 @@ esac
 VERSION_FILE="{version}"
 LOG_FILE="{log}"
 case "$1" in
-  --version)
+  --version|--revision)
     read ver < "$VERSION_FILE"
     printf '%s\n' "$ver"
     ;;

@@ -932,7 +932,9 @@ impl Default for ConcurrencyProbeExecutor {
 impl ConcurrencyProbeExecutor {
     fn is_tool_version_read(command: &CommandSpec) -> bool {
         let path = command.program.as_str();
-        let version_args = command.args == ["--version"] || command.args == ["version"];
+        let version_args = command.args == ["--version"]
+            || command.args == ["--revision"]
+            || command.args == ["version"];
         version_args
             && (path.ends_with("/node")
                 || path.ends_with("/npm")
@@ -961,7 +963,10 @@ impl CommandExecutor for ConcurrencyProbeExecutor {
             ("/usr/bin/which", args) if args.len() == 1 => {
                 format!("/fixture/bin/{}\n", args[0])
             }
-            (path, args) if path.starts_with("/fixture/bin/") && args == ["--version"] => {
+            (path, args)
+                if path.starts_with("/fixture/bin/")
+                    && (args == ["--version"] || args == ["--revision"]) =>
+            {
                 match path {
                     "/fixture/bin/node" => "v20.0.0\n".into(),
                     "/fixture/bin/npm" => "10.0.0\n".into(),
@@ -982,7 +987,7 @@ impl CommandExecutor for ConcurrencyProbeExecutor {
             ("rustup", args) if args == ["show", "active-toolchain"] => {
                 "stable-aarch64-apple-darwin (default)\n".into()
             }
-            ("bun", args) if args == ["--version"] => "1.1.0\n".into(),
+            ("bun", args) if args == ["--revision"] => "1.1.0\n".into(),
             ("deno", args) if args == ["--version"] => {
                 "deno 1.40.0 (release, aarch64-apple-darwin)\n".into()
             }
@@ -1058,7 +1063,9 @@ impl Default for ReverseCompletionExecutor {
 impl CommandExecutor for ReverseCompletionExecutor {
     async fn execute(&self, command: &CommandSpec, _timeout_seconds: u64) -> Result<CommandOutput> {
         self.calls.lock().unwrap().push(command.clone());
-        let is_version_read = command.args == ["--version"] || command.args == ["version"];
+        let is_version_read = command.args == ["--version"]
+            || command.args == ["--revision"]
+            || command.args == ["version"];
         if is_version_read {
             let delay_ms = if command.program.ends_with("/node") {
                 5

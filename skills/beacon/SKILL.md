@@ -69,9 +69,10 @@ Show the user:
 - Current and latest versions.
 - Detected installation source and update manager, kept separate.
 - The exact action Beacon reports.
-- Whether the action has an `exact` or `floating` target mode:
+- Whether the action has an `exact`, `floating`, or `rolling` target mode:
   - `exact`: post-upgrade version must equal the confirmed expected version.
   - `floating`: manager policy is preserved; post-upgrade version must be newer than the old version and no lower than the confirmed candidate.
+  - `rolling`: a moving channel is preserved; the observed revision must change, but it may advance beyond the revision seen during confirmation.
 
 Ask for explicit confirmation of the final target set after showing this information. A prior general request such as "update my environment" is not the required final confirmation.
 

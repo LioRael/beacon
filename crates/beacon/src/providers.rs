@@ -97,6 +97,7 @@ impl ToolVersion {
 pub enum TargetMode {
     Exact,
     Floating,
+    Rolling,
 }
 
 impl TargetMode {
@@ -104,6 +105,7 @@ impl TargetMode {
         match self {
             Self::Exact => "exact",
             Self::Floating => "floating",
+            Self::Rolling => "rolling",
         }
     }
 }
@@ -357,6 +359,12 @@ where
                 actual.display()
             )
         }
+        TargetMode::Rolling if actual == old => {
+            bail!(
+                "rolling verification requires the observed revision to change, still {}",
+                actual.display()
+            )
+        }
         _ => {}
     }
     Ok(())
@@ -417,6 +425,26 @@ fn rust_version_number(output: &str) -> Option<String> {
     Some(format!("{}.{}", version, date.replace('-', "")))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BunChannel<'a> {
+    Stable,
+    Canary { revision: Option<&'a str> },
+}
+
+fn bun_channel(version: &ToolVersion) -> BunChannel<'_> {
+    let value = version.display();
+    if value.contains("-canary") || value.starts_with("canary+") {
+        BunChannel::Canary {
+            revision: value
+                .split_once('+')
+                .map(|(_, revision)| revision)
+                .filter(|revision| !revision.is_empty()),
+        }
+    } else {
+        BunChannel::Stable
+    }
+}
+
 #[async_trait]
 impl ToolAdapter for BuiltinToolAdapter {
     fn id(&self) -> ToolId {
@@ -473,6 +501,28 @@ impl ToolAdapter for BuiltinToolAdapter {
     }
 
     fn compare(&self, current: &ToolVersion, latest: &ToolVersion) -> Result<Ordering> {
+        if let (
+            BunChannel::Canary {
+                revision: current_revision,
+            },
+            BunChannel::Canary {
+                revision: latest_revision,
+            },
+        ) = (bun_channel(current), bun_channel(latest))
+        {
+            let current_revision =
+                current_revision.context("Bun canary version had no revision")?;
+            let latest_revision = latest_revision.context("Bun canary latest had no revision")?;
+            return Ok(
+                if current_revision.starts_with(latest_revision)
+                    || latest_revision.starts_with(current_revision)
+                {
+                    Ordering::Equal
+                } else {
+                    Ordering::Less
+                },
+            );
+        }
         Ok(semver::Version::parse(current.display())?
             .cmp(&semver::Version::parse(latest.display())?))
     }
@@ -494,7 +544,7 @@ adapter!(NODE_ADAPTER, "node", "Node.js", "node", ["--version"]);
 adapter!(NPM_ADAPTER, "npm", "npm", "npm", ["--version"]);
 adapter!(PNPM_ADAPTER, "pnpm", "pnpm", "pnpm", ["--version"]);
 adapter!(GO_ADAPTER, "go", "Go", "go", ["version"]);
-adapter!(BUN_ADAPTER, "bun", "Bun", "bun", ["--version"]);
+adapter!(BUN_ADAPTER, "bun", "Bun", "bun", ["--revision"]);
 adapter!(DENO_ADAPTER, "deno", "Deno", "deno", ["--version"]);
 adapter!(UV_ADAPTER, "uv", "uv", "uv", ["--version"]);
 
@@ -861,7 +911,7 @@ impl InstallManager for BuiltinInstallManager {
             ManagerKind::Rustup => CommandSpec::new("rustup", ["show", "active-toolchain"]),
             ManagerKind::Npm => CommandSpec::new("npm", ["prefix", "--global"]),
             ManagerKind::Corepack => CommandSpec::new("corepack", ["--version"]),
-            ManagerKind::BunOfficial => CommandSpec::new("bun", ["--version"]),
+            ManagerKind::BunOfficial => CommandSpec::new("bun", ["--revision"]),
             ManagerKind::DenoOfficial => CommandSpec::new("deno", ["--version"]),
             ManagerKind::UvStandalone => unreachable!("uv snapshot handled above"),
         };
@@ -1029,6 +1079,8 @@ impl InstallManager for BuiltinInstallManager {
         snapshot: &ManagerSnapshot,
         context: &ProviderContext<'_>,
     ) -> Result<ToolVersion> {
+        let bun_canary = self.kind == ManagerKind::BunOfficial
+            && matches!(bun_channel(&tool.version), BunChannel::Canary { .. });
         let command = match self.kind {
             ManagerKind::Homebrew => {
                 CommandSpec::new("brew", ["info", "--json=v2", tool.id.as_str()])
@@ -1041,6 +1093,15 @@ impl InstallManager for BuiltinInstallManager {
             ManagerKind::Npm | ManagerKind::Corepack => {
                 CommandSpec::new("npm", ["view", tool.id.as_str(), "version"])
             }
+            ManagerKind::BunOfficial if bun_canary => CommandSpec::new(
+                "git",
+                [
+                    "ls-remote",
+                    "--tags",
+                    "https://github.com/oven-sh/bun.git",
+                    "refs/tags/canary",
+                ],
+            ),
             ManagerKind::BunOfficial => CommandSpec::new(
                 "curl",
                 [
@@ -1102,6 +1163,18 @@ impl InstallManager for BuiltinInstallManager {
                     .find(|line| line.starts_with(channel))
                     .and_then(rust_version_number)
                     .context("rustup check had no active-channel version")?
+            }
+            ManagerKind::BunOfficial if bun_canary => {
+                let revision = output
+                    .stdout
+                    .split_whitespace()
+                    .next()
+                    .filter(|revision| {
+                        revision.len() == 40
+                            && revision.bytes().all(|byte| byte.is_ascii_hexdigit())
+                    })
+                    .context("Bun canary tag response had no commit revision")?;
+                format!("canary+{}", &revision[..9])
             }
             ManagerKind::BunOfficial => output
                 .stdout
@@ -1211,9 +1284,18 @@ impl InstallManager for BuiltinInstallManager {
                 ),
                 TargetMode::Exact,
             ),
-            ManagerKind::BunOfficial => {
-                (CommandSpec::new("bun", ["upgrade"]), TargetMode::Floating)
+            ManagerKind::BunOfficial
+                if matches!(bun_channel(&tool.version), BunChannel::Canary { .. }) =>
+            {
+                (
+                    CommandSpec::new("bun", ["upgrade", "--canary"]),
+                    TargetMode::Rolling,
+                )
             }
+            ManagerKind::BunOfficial => (
+                CommandSpec::new("bun", ["upgrade", "--stable"]),
+                TargetMode::Floating,
+            ),
             ManagerKind::DenoOfficial => (
                 CommandSpec::new("deno", ["upgrade", "--version", latest.display()]),
                 TargetMode::Exact,

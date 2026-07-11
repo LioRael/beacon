@@ -1077,7 +1077,7 @@ fn official_bun_and_deno_report_safe_channel_specific_actions() {
             "1.2.1",
             "bun-official",
             "floating",
-            serde_json::json!(["upgrade"]),
+            serde_json::json!(["upgrade", "--stable"]),
         ),
         (
             "deno",
@@ -1133,6 +1133,63 @@ fn official_bun_check_does_not_depend_on_the_rate_limited_github_api() {
     let bun = tool_report(&value, "bun");
     assert_eq!(bun["status"], "outdated");
     assert_eq!(bun["update"]["latest"]["normalized"], "1.2.1");
+}
+
+#[test]
+fn official_bun_canary_uses_revision_and_canary_latest_instead_of_stable() {
+    let home = tempfile::tempdir().unwrap();
+    let bin = home.path().join(".bun/bin");
+    let stable_lookup_log = home.path().join("stable-lookup.log");
+    write_executable(
+        &bin.join("bun"),
+        "#!/bin/sh\ncase \"$1\" in\n  --version) printf '1.4.0\\n' ;;\n  --revision) printf '1.4.0-canary.1+91675d0ba\\n' ;;\n  *) exit 64 ;;\nesac\n",
+    );
+    write_executable(
+        &bin.join("git"),
+        "#!/bin/sh\nprintf '0d4b4c494243cf73bf704971dcc0711c5882a8aa\\trefs/tags/canary\\n'\n",
+    );
+    write_executable(
+        &bin.join("curl"),
+        &format!(
+            "#!/bin/sh\nprintf 'called\\n' >> '{}'\nprintf 'https://github.com/oven-sh/bun/releases/tag/bun-v1.3.14\\n'\n",
+            stable_lookup_log.display()
+        ),
+    );
+
+    let value = check_json(home.path(), &bin, None);
+    let bun = tool_report(&value, "bun");
+    assert_eq!(bun["status"], "outdated");
+    assert_eq!(
+        bun["installation"]["current"]["normalized"],
+        "1.4.0-canary.1+91675d0ba"
+    );
+    assert_eq!(bun["update"]["latest"]["normalized"], "canary+0d4b4c494");
+    assert_eq!(bun["update"]["action"]["target_mode"], "rolling");
+    assert_eq!(
+        bun["update"]["action"]["command"]["args"],
+        serde_json::json!(["upgrade", "--canary"])
+    );
+    assert!(!stable_lookup_log.exists());
+}
+
+#[test]
+fn official_bun_canary_is_current_when_revision_matches_the_canary_tag() {
+    let home = tempfile::tempdir().unwrap();
+    let bin = home.path().join(".bun/bin");
+    write_executable(
+        &bin.join("bun"),
+        "#!/bin/sh\nprintf '1.4.0-canary.1+0d4b4c494\\n'\n",
+    );
+    write_executable(
+        &bin.join("git"),
+        "#!/bin/sh\nprintf '0d4b4c494243cf73bf704971dcc0711c5882a8aa\\trefs/tags/canary\\n'\n",
+    );
+    write_executable(&bin.join("curl"), "#!/bin/sh\nexit 64\n");
+
+    let value = check_json(home.path(), &bin, None);
+    let bun = tool_report(&value, "bun");
+    assert_eq!(bun["status"], "current");
+    assert_eq!(bun["update"]["latest"]["normalized"], "canary+0d4b4c494");
 }
 
 #[test]
