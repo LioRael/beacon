@@ -734,7 +734,7 @@ fn check_json_reports_the_active_rustup_channel_without_reading_project_policy()
     write_executable(
         &bin.join("rustup"),
         &format!(
-            "#!/bin/sh\nif [ \"${{0##*/}}\" = rustc ]; then printf 'rustc 1.80.0 (fixture)\\n'; exit; fi\ncase \"$1 $2\" in\n  'show active-toolchain') printf 'stable-aarch64-apple-darwin (default)\\n' ;;\n  'which rustc') printf '{}\\n' ;;\n  'check ') printf 'stable-aarch64-apple-darwin - Update available : 1.80.0 -> 1.81.0\\n' ;;\nesac\n",
+            "#!/bin/sh\nif [ \"${{0##*/}}\" = rustc ]; then printf 'rustc 1.99.0-nightly (af3d95584 2026-07-09)\\n'; exit; fi\ncase \"$1 $2\" in\n  'show active-toolchain') printf 'nightly-aarch64-apple-darwin (default)\\n' ;;\n  'which rustc') printf '{}\\n' ;;\n  'check ') printf 'nightly-aarch64-apple-darwin - update available: 1.99.0-nightly (af3d95584 2026-07-09) -> 1.99.0-nightly (375b1431b 2026-07-10)\\n'; exit 100 ;;\nesac\n",
             rustc.display()
         ),
     );
@@ -767,8 +767,16 @@ fn check_json_reports_the_active_rustup_channel_without_reading_project_policy()
     assert_eq!(rust["status"], "outdated");
     assert_eq!(rust["update"]["manager"], "rustup");
     assert_eq!(
+        rust["installation"]["current"]["normalized"],
+        "1.99.0-nightly.20260709"
+    );
+    assert_eq!(
+        rust["update"]["latest"]["normalized"],
+        "1.99.0-nightly.20260710"
+    );
+    assert_eq!(
         rust["update"]["action"]["command"]["args"],
-        serde_json::json!(["update", "stable-aarch64-apple-darwin"])
+        serde_json::json!(["update", "nightly-aarch64-apple-darwin"])
     );
     assert_eq!(std::fs::read_to_string(policy).unwrap(), original);
 }
@@ -1094,7 +1102,9 @@ fn official_bun_and_deno_report_safe_channel_specific_actions() {
         if tool == "bun" {
             write_executable(
                 &bin.join("curl"),
-                &format!("#!/bin/sh\nprintf '{{\"tag_name\":\"bun-v{latest}\"}}\\n'\n"),
+                &format!(
+                    "#!/bin/sh\nprintf 'https://github.com/oven-sh/bun/releases/tag/bun-v{latest}\\n'\n"
+                ),
             );
         }
 
@@ -1107,6 +1117,22 @@ fn official_bun_and_deno_report_safe_channel_specific_actions() {
         assert_eq!(report["update"]["action"]["target_mode"], mode);
         assert_eq!(report["update"]["action"]["command"]["args"], expected_args);
     }
+}
+
+#[test]
+fn official_bun_check_does_not_depend_on_the_rate_limited_github_api() {
+    let home = tempfile::tempdir().unwrap();
+    let bin = home.path().join(".bun/bin");
+    write_executable(&bin.join("bun"), "#!/bin/sh\nprintf '1.2.0\\n'\n");
+    write_executable(
+        &bin.join("curl"),
+        "#!/bin/sh\ncase \"$*\" in\n  *api.github.com*) printf 'API rate limit exceeded\\n' >&2; exit 56 ;;\n  *github.com/oven-sh/bun/releases/latest*) printf 'https://github.com/oven-sh/bun/releases/tag/bun-v1.2.1\\n' ;;\n  *) printf 'unexpected curl arguments: %s\\n' \"$*\" >&2; exit 64 ;;\nesac\n",
+    );
+
+    let value = check_json(home.path(), &bin, None);
+    let bun = tool_report(&value, "bun");
+    assert_eq!(bun["status"], "outdated");
+    assert_eq!(bun["update"]["latest"]["normalized"], "1.2.1");
 }
 
 #[test]

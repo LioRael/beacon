@@ -393,6 +393,30 @@ struct BuiltinToolAdapter {
     version_args: &'static [&'static str],
 }
 
+fn rust_version_number(output: &str) -> Option<String> {
+    let version = output
+        .split_whitespace()
+        .filter_map(version_number)
+        .next_back()?;
+    if !version.contains("-nightly") {
+        return Some(version);
+    }
+    let date = output
+        .split_whitespace()
+        .map(|token| token.trim_matches(|character| matches!(character, '(' | ')')))
+        .rfind(|token| {
+            let bytes = token.as_bytes();
+            bytes.len() == 10
+                && bytes[4] == b'-'
+                && bytes[7] == b'-'
+                && bytes
+                    .iter()
+                    .enumerate()
+                    .all(|(index, byte)| matches!(index, 4 | 7) || byte.is_ascii_digit())
+        })?;
+    Some(format!("{}.{}", version, date.replace('-', "")))
+}
+
 #[async_trait]
 impl ToolAdapter for BuiltinToolAdapter {
     fn id(&self) -> ToolId {
@@ -430,12 +454,17 @@ impl ToolAdapter for BuiltinToolAdapter {
     }
 
     fn parse_version(&self, output: &str) -> Result<ToolVersion> {
-        let normalized =
+        let raw_version =
             version_number(output).context("version output did not contain a version")?;
+        let normalized = if self.id == "rust" {
+            rust_version_number(output).unwrap_or_else(|| raw_version.clone())
+        } else {
+            raw_version.clone()
+        };
         let raw = output
             .split_whitespace()
-            .find(|token| token.contains(&normalized))
-            .unwrap_or(&normalized)
+            .find(|token| token.contains(&raw_version))
+            .unwrap_or(&raw_version)
             .trim_matches(|character: char| {
                 !(character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '+' | '_'))
             })
@@ -1008,7 +1037,7 @@ impl InstallManager for BuiltinInstallManager {
                 let selector = mise_selector(tool, snapshot).unwrap_or("latest");
                 CommandSpec::new("mise", ["latest", &format!("{}@{selector}", tool.id)])
             }
-            ManagerKind::Rustup => CommandSpec::new("rustup", ["check"]),
+            ManagerKind::Rustup => CommandSpec::new("rustup", ["check"]).accepting_exit_code(100),
             ManagerKind::Npm | ManagerKind::Corepack => {
                 CommandSpec::new("npm", ["view", tool.id.as_str(), "version"])
             }
@@ -1018,7 +1047,11 @@ impl InstallManager for BuiltinInstallManager {
                     "--fail",
                     "--silent",
                     "--show-error",
-                    "https://api.github.com/repos/oven-sh/bun/releases/latest",
+                    "--output",
+                    "/dev/null",
+                    "--write-out",
+                    "%{redirect_url}",
+                    "https://github.com/oven-sh/bun/releases/latest",
                 ],
             ),
             ManagerKind::DenoOfficial => CommandSpec::new("deno", ["upgrade", "--dry-run"]),
@@ -1067,21 +1100,18 @@ impl InstallManager for BuiltinInstallManager {
                     .stdout
                     .lines()
                     .find(|line| line.starts_with(channel))
-                    .and_then(|line| {
-                        line.split_whitespace()
-                            .filter_map(version_number)
-                            .next_back()
-                    })
+                    .and_then(rust_version_number)
                     .context("rustup check had no active-channel version")?
             }
-            ManagerKind::BunOfficial => {
-                let value: serde_json::Value =
-                    serde_json::from_str(&output.stdout).context("invalid Bun release response")?;
-                value["tag_name"]
-                    .as_str()
-                    .and_then(|tag| version_number(tag.trim_start_matches("bun-")))
-                    .context("Bun release response had no version")?
-            }
+            ManagerKind::BunOfficial => output
+                .stdout
+                .trim()
+                .rsplit('/')
+                .next()
+                .and_then(|tag| {
+                    version_number(tag.trim_start_matches("bun-").trim_start_matches('v'))
+                })
+                .context("Bun release response had no version")?,
             _ => version_number(&output.stdout).context("latest output had no version")?,
         };
         ToolVersion::new(normalized.clone(), Some(normalized))

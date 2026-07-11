@@ -996,7 +996,7 @@ impl CommandExecutor for ConcurrencyProbeExecutor {
             ("rustup", args) if args == ["check"] => {
                 "stable-aarch64-apple-darwin - Up to date : 1.80.0\n".into()
             }
-            ("curl", _) => r#"{"tag_name":"bun-v1.1.0"}"#.into(),
+            ("curl", _) => "https://github.com/oven-sh/bun/releases/tag/bun-v1.1.0\n".into(),
             ("deno", args) if args.first().map(String::as_str) == Some("upgrade") => {
                 "Current version: 1.40.0\nLatest version: 1.40.0\n".into()
             }

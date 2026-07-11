@@ -183,7 +183,9 @@ esac
     );
     write_executable(
         &bin.join("curl"),
-        &format!("#!/bin/sh\nprintf '{{\"tag_name\":\"{latest_tag}\"}}\\n'\n"),
+        &format!(
+            "#!/bin/sh\nprintf 'https://github.com/oven-sh/bun/releases/tag/{latest_tag}\\n'\n"
+        ),
     );
     write_config(home.path(), &["bun"]);
     BunFixture { home, bin, log }
@@ -510,7 +512,7 @@ esac
     );
     write_executable(
         &bun_bin.join("curl"),
-        "#!/bin/sh\nprintf '{\"tag_name\":\"bun-v1.2.1\"}\\n'\n",
+        "#!/bin/sh\nprintf 'https://github.com/oven-sh/bun/releases/tag/bun-v1.2.1\\n'\n",
     );
     write_config(home.path(), &["bun", "deno"]);
 

@@ -8,6 +8,8 @@ pub mod command {
     pub struct CommandSpec {
         pub program: String,
         pub args: Vec<String>,
+        #[serde(skip, default)]
+        pub accepted_exit_codes: Vec<i32>,
     }
 
     impl CommandSpec {
@@ -18,7 +20,13 @@ pub mod command {
             Self {
                 program: program.into(),
                 args: args.into_iter().map(Into::into).collect(),
+                accepted_exit_codes: Vec::new(),
             }
+        }
+
+        pub fn accepting_exit_code(mut self, code: i32) -> Self {
+            self.accepted_exit_codes.push(code);
+            self
         }
 
         pub fn brew_inventory_upgrade(kind: &str, target: &str) -> Result<Self> {
@@ -883,7 +891,11 @@ pub mod runner {
         .with_context(|| format!("command timed out: {}", spec.display()))??;
         let stdout = String::from_utf8_lossy(&stdout).trim().to_string();
         let stderr = String::from_utf8_lossy(&stderr).trim().to_string();
-        if !status.success() {
+        if !status.success()
+            && !status
+                .code()
+                .is_some_and(|code| spec.accepted_exit_codes.contains(&code))
+        {
             let message = format!("{} failed ({}): {}", spec.display(), status, stderr);
             bail!("{}", crate::redact::redact(&message, home.as_deref()));
         }
