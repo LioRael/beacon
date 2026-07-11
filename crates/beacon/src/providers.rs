@@ -484,6 +484,14 @@ pub fn tool_registry() -> &'static [&'static dyn ToolAdapter] {
     &TOOL_REGISTRY
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ToolProbe {
+    pub id: String,
+    pub name: String,
+    pub available: bool,
+    pub detail: Option<String>,
+}
+
 fn tool_executable_name(id: &str) -> &str {
     if id == "rust" { "rustc" } else { id }
 }
@@ -1852,6 +1860,69 @@ impl ProgressSink for Ui {
     }
     fn finished(&self, _label: &str) {
         self.finish_progress();
+    }
+}
+
+pub async fn probe_tools(config: &Config, ui: &Ui) -> Vec<ToolProbe> {
+    let ids = tool_registry()
+        .iter()
+        .map(|adapter| adapter.id().to_string())
+        .collect::<Vec<_>>();
+    probe_tools_for(config, ui, &ids).await
+}
+
+pub async fn probe_tools_for(config: &Config, ui: &Ui, ids: &[String]) -> Vec<ToolProbe> {
+    let executor = SystemCommandExecutor {
+        verbose: ui.mode() == crate::ui::FeedbackMode::Verbose,
+    };
+    let context = ProviderContext::new(&executor, ui, config.command_timeout_seconds);
+    stream::iter(
+        tool_registry()
+            .iter()
+            .copied()
+            .filter(|adapter| ids.iter().any(|id| id == adapter.id().as_str()))
+            .map(|adapter| {
+                let context = &context;
+                async move {
+                    match adapter.detect(context).await {
+                        Ok(_) => ToolProbe {
+                            id: adapter.id().to_string(),
+                            name: adapter.display_name().into(),
+                            available: true,
+                            detail: None,
+                        },
+                        Err(error) => ToolProbe {
+                            id: adapter.id().to_string(),
+                            name: adapter.display_name().into(),
+                            available: false,
+                            detail: Some(error.to_string()),
+                        },
+                    }
+                }
+            }),
+    )
+    .buffered(4)
+    .collect()
+    .await
+}
+
+pub async fn available_inventories(config: &Config, ui: &Ui) -> Vec<String> {
+    let executor = SystemCommandExecutor {
+        verbose: ui.mode() == crate::ui::FeedbackMode::Verbose,
+    };
+    let context = ProviderContext::new(&executor, ui, config.command_timeout_seconds);
+    let found = context
+        .execute_silent(&CommandSpec::new("/usr/bin/which", ["brew"]))
+        .await
+        .is_ok()
+        && context
+            .execute_silent(&CommandSpec::new("brew", ["--version"]))
+            .await
+            .is_ok();
+    if found {
+        vec!["homebrew".into()]
+    } else {
+        Vec::new()
     }
 }
 

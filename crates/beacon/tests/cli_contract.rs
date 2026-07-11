@@ -129,6 +129,7 @@ fn history_json_records_source_and_updater_without_manager_field() {
 fn check_json_v2_separates_tools_and_inventories_and_uses_explicit_nulls() {
     let home = tempfile::tempdir().unwrap();
     let path = tempfile::tempdir().unwrap();
+    write_v3_config(home.path(), &["node"]);
     let output = Command::new(env!("CARGO_BIN_EXE_beacon"))
         .args(["check", "--json"])
         .env("HOME", home.path())
@@ -161,6 +162,7 @@ fn check_json_v2_separates_tools_and_inventories_and_uses_explicit_nulls() {
 fn doctor_json_v2_separates_tools_and_inventories() {
     let home = tempfile::tempdir().unwrap();
     let path = tempfile::tempdir().unwrap();
+    write_v3_config(home.path(), &["node"]);
     let output = Command::new(env!("CARGO_BIN_EXE_beacon"))
         .args(["doctor", "node", "--json"])
         .env("HOME", home.path())
@@ -249,11 +251,15 @@ fn check_json_keeps_progress_silent_on_stderr() {
 }
 
 #[test]
-fn config_show_json_uses_the_v2_envelope() {
+fn fresh_config_enables_only_tools_available_on_the_current_path() {
     let home = tempfile::tempdir().unwrap();
+    let bin = tempfile::tempdir().unwrap();
+    write_executable(&bin.path().join("node"), "#!/bin/sh\nprintf 'v26.5.0\\n'\n");
+    write_executable(&bin.path().join("bun"), "#!/bin/sh\nprintf '1.4.0\\n'\n");
     let output = Command::new(env!("CARGO_BIN_EXE_beacon"))
         .args(["config", "show", "--json"])
         .env("HOME", home.path())
+        .env("PATH", bin.path())
         .output()
         .unwrap();
 
@@ -262,16 +268,32 @@ fn config_show_json_uses_the_v2_envelope() {
     let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(value["schema_version"], 2);
     assert_eq!(value["status"], "ok");
-    assert_eq!(value["data"]["schema_version"], 2);
+    assert_eq!(value["data"]["schema_version"], 3);
     assert_eq!(
         value["data"]["enabled_tools"],
-        serde_json::json!(["rust", "node", "npm", "pnpm", "go", "bun", "deno", "uv"])
+        serde_json::json!(["node", "bun"])
     );
-    assert_eq!(
-        value["data"]["enabled_inventories"],
-        serde_json::json!(["homebrew"])
-    );
+    assert_eq!(value["data"]["disabled_tools"], serde_json::json!([]));
+    assert_eq!(value["data"]["enabled_inventories"], serde_json::json!([]));
+    assert_eq!(value["data"]["tool_catalog_version"], 1);
     assert!(value["errors"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn fresh_human_command_points_to_the_config_and_interactive_editor() {
+    let home = tempfile::tempdir().unwrap();
+    let bin = tempfile::tempdir().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_beacon"))
+        .args(["config", "show"])
+        .env("HOME", home.path())
+        .env("PATH", bin.path())
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("Initialized Beacon config at"), "{stderr}");
+    assert!(stderr.contains("beacon config tools edit"), "{stderr}");
 }
 
 fn config_path_for(home: &std::path::Path) -> std::path::PathBuf {
@@ -281,9 +303,277 @@ fn config_path_for(home: &std::path::Path) -> std::path::PathBuf {
     home.join("Library/Application Support/Beacon/config.toml")
 }
 
+fn write_v3_config(home: &std::path::Path, enabled_tools: &[&str]) {
+    let path = config_path_for(home);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let tools = enabled_tools
+        .iter()
+        .map(|tool| format!("\"{tool}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    std::fs::write(
+        path,
+        format!(
+            "schema_version = 3\nenabled_tools = [{tools}]\ndisabled_tools = []\nenabled_inventories = []\ndisabled_inventories = [\"homebrew\"]\ntool_catalog_version = 1\nhistory_limit = 500\ncommand_timeout_seconds = 120\n"
+        ),
+    )
+    .unwrap();
+}
+
+#[test]
+fn cli_v2_migration_prunes_missing_tools_and_adds_installed_supported_tools() {
+    let home = tempfile::tempdir().unwrap();
+    let bin = tempfile::tempdir().unwrap();
+    write_executable(&bin.path().join("node"), "#!/bin/sh\nprintf 'v26.5.0\\n'\n");
+    write_executable(&bin.path().join("bun"), "#!/bin/sh\nprintf '1.4.0\\n'\n");
+    write_executable(
+        &bin.path().join("uv"),
+        "#!/bin/sh\nprintf 'uv 0.11.28 (fixture)\\n'\n",
+    );
+    let path = config_path_for(home.path());
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let original = "schema_version = 2\nenabled_tools = [\"node\", \"pnpm\", \"go\"]\nenabled_inventories = []\nhistory_limit = 500\ncommand_timeout_seconds = 120\n";
+    std::fs::write(&path, original).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_beacon"))
+        .args(["config", "show", "--json"])
+        .env("HOME", home.path())
+        .env("PATH", bin.path())
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["data"]["schema_version"], 3);
+    assert_eq!(
+        value["data"]["enabled_tools"],
+        serde_json::json!(["node", "bun", "uv"])
+    );
+    assert_eq!(value["data"]["disabled_tools"], serde_json::json!([]));
+    assert_eq!(
+        std::fs::read_to_string(path.with_file_name("config.toml.v2.bak")).unwrap(),
+        original
+    );
+}
+
+#[test]
+fn config_tools_enable_tracks_a_missing_tool_and_returns_a_json_change_set() {
+    let home = tempfile::tempdir().unwrap();
+    let bin = tempfile::tempdir().unwrap();
+    write_executable(&bin.path().join("node"), "#!/bin/sh\nprintf 'v26.5.0\\n'\n");
+
+    let enabled = Command::new(env!("CARGO_BIN_EXE_beacon"))
+        .args(["config", "tools", "enable", "pnpm", "--json"])
+        .env("HOME", home.path())
+        .env("PATH", bin.path())
+        .output()
+        .unwrap();
+    assert!(
+        enabled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&enabled.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&enabled.stdout).unwrap();
+    assert_eq!(value["schema_version"], 2);
+    assert_eq!(value["data"]["added"], serde_json::json!(["pnpm"]));
+    assert_eq!(value["data"]["before"], serde_json::json!(["node"]));
+    assert_eq!(value["data"]["after"], serde_json::json!(["node", "pnpm"]));
+
+    let check = Command::new(env!("CARGO_BIN_EXE_beacon"))
+        .args(["check", "--json"])
+        .env("HOME", home.path())
+        .env("PATH", bin.path())
+        .output()
+        .unwrap();
+    assert!(
+        check.status.success(),
+        "{}",
+        String::from_utf8_lossy(&check.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&check.stdout).unwrap();
+    assert_eq!(tool_report(&value, "pnpm")["status"], "missing");
+}
+
+#[test]
+fn config_tools_sync_respects_an_explicitly_disabled_installed_tool() {
+    let home = tempfile::tempdir().unwrap();
+    let bin = tempfile::tempdir().unwrap();
+    write_executable(&bin.path().join("bun"), "#!/bin/sh\nprintf '1.4.0\\n'\n");
+
+    let disabled = Command::new(env!("CARGO_BIN_EXE_beacon"))
+        .args(["config", "tools", "disable", "bun", "--json"])
+        .env("HOME", home.path())
+        .env("PATH", bin.path())
+        .output()
+        .unwrap();
+    assert!(disabled.status.success());
+
+    let synced = Command::new(env!("CARGO_BIN_EXE_beacon"))
+        .args(["config", "tools", "sync", "--json"])
+        .env("HOME", home.path())
+        .env("PATH", bin.path())
+        .output()
+        .unwrap();
+    assert!(
+        synced.status.success(),
+        "{}",
+        String::from_utf8_lossy(&synced.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&synced.stdout).unwrap();
+    assert_eq!(value["data"]["after"], serde_json::json!([]));
+    assert_eq!(value["data"]["disabled"], serde_json::json!(["bun"]));
+    assert!(
+        value["data"]["skipped"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| { item["id"] == "bun" && item["reason"] == "explicitly disabled" })
+    );
+}
+
+#[test]
+fn config_tools_rejects_an_unknown_id_without_partial_changes() {
+    let home = tempfile::tempdir().unwrap();
+    let bin = tempfile::tempdir().unwrap();
+    write_executable(&bin.path().join("node"), "#!/bin/sh\nprintf 'v26.5.0\\n'\n");
+
+    let rejected = Command::new(env!("CARGO_BIN_EXE_beacon"))
+        .args(["config", "tools", "enable", "bun", "uvm", "--json"])
+        .env("HOME", home.path())
+        .env("PATH", bin.path())
+        .output()
+        .unwrap();
+    assert_eq!(rejected.status.code(), Some(1));
+    assert!(rejected.stderr.is_empty());
+    let error: serde_json::Value = serde_json::from_slice(&rejected.stdout).unwrap();
+    assert!(
+        error["errors"][0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("did you mean `uv`")
+    );
+
+    let shown = Command::new(env!("CARGO_BIN_EXE_beacon"))
+        .args(["config", "show", "--json"])
+        .env("HOME", home.path())
+        .env("PATH", bin.path())
+        .output()
+        .unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&shown.stdout).unwrap();
+    assert_eq!(value["data"]["enabled_tools"], serde_json::json!(["node"]));
+}
+
+#[test]
+fn check_does_not_auto_enable_a_tool_installed_after_initialization() {
+    let home = tempfile::tempdir().unwrap();
+    let first_bin = tempfile::tempdir().unwrap();
+    write_executable(
+        &first_bin.path().join("node"),
+        "#!/bin/sh\nprintf 'v26.5.0\\n'\n",
+    );
+    let initialized = Command::new(env!("CARGO_BIN_EXE_beacon"))
+        .args(["config", "show", "--json"])
+        .env("HOME", home.path())
+        .env("PATH", first_bin.path())
+        .output()
+        .unwrap();
+    assert!(initialized.status.success());
+
+    let second_bin = tempfile::tempdir().unwrap();
+    write_executable(
+        &second_bin.path().join("node"),
+        "#!/bin/sh\nprintf 'v26.5.0\\n'\n",
+    );
+    write_executable(
+        &second_bin.path().join("bun"),
+        "#!/bin/sh\nprintf '1.4.0\\n'\n",
+    );
+    let checked = Command::new(env!("CARGO_BIN_EXE_beacon"))
+        .args(["check", "--json"])
+        .env("HOME", home.path())
+        .env("PATH", second_bin.path())
+        .output()
+        .unwrap();
+    assert!(checked.status.success());
+    let value: serde_json::Value = serde_json::from_slice(&checked.stdout).unwrap();
+    assert!(
+        value["data"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|item| item["id"] != "bun")
+    );
+}
+
+#[test]
+fn config_tools_reset_clears_disabled_choices_and_redetects_installed_tools() {
+    let home = tempfile::tempdir().unwrap();
+    let bin = tempfile::tempdir().unwrap();
+    write_executable(&bin.path().join("bun"), "#!/bin/sh\nprintf '1.4.0\\n'\n");
+    let disabled = Command::new(env!("CARGO_BIN_EXE_beacon"))
+        .args(["config", "tools", "disable", "bun", "--json"])
+        .env("HOME", home.path())
+        .env("PATH", bin.path())
+        .output()
+        .unwrap();
+    assert!(disabled.status.success());
+
+    let reset = Command::new(env!("CARGO_BIN_EXE_beacon"))
+        .args(["config", "tools", "reset", "--json"])
+        .env("HOME", home.path())
+        .env("PATH", bin.path())
+        .output()
+        .unwrap();
+    assert!(reset.status.success());
+    let value: serde_json::Value = serde_json::from_slice(&reset.stdout).unwrap();
+    assert_eq!(value["data"]["after"], serde_json::json!(["bun"]));
+    assert_eq!(value["data"]["disabled"], serde_json::json!([]));
+}
+
+#[test]
+fn config_inventories_disable_and_reset_have_json_change_sets() {
+    let home = tempfile::tempdir().unwrap();
+    let bin = tempfile::tempdir().unwrap();
+    write_executable(
+        &bin.path().join("brew"),
+        "#!/bin/sh\nprintf 'Homebrew 5.0.0\\n'\n",
+    );
+    let disabled = Command::new(env!("CARGO_BIN_EXE_beacon"))
+        .args(["config", "inventories", "disable", "homebrew", "--json"])
+        .env("HOME", home.path())
+        .env("PATH", bin.path())
+        .output()
+        .unwrap();
+    assert!(disabled.status.success());
+    let value: serde_json::Value = serde_json::from_slice(&disabled.stdout).unwrap();
+    assert_eq!(value["data"]["removed"], serde_json::json!(["homebrew"]));
+    assert_eq!(value["data"]["disabled"], serde_json::json!(["homebrew"]));
+
+    let reset = Command::new(env!("CARGO_BIN_EXE_beacon"))
+        .args(["config", "inventories", "reset", "--json"])
+        .env("HOME", home.path())
+        .env("PATH", bin.path())
+        .output()
+        .unwrap();
+    assert!(reset.status.success());
+    let value: serde_json::Value = serde_json::from_slice(&reset.stdout).unwrap();
+    assert_eq!(value["data"]["after"], serde_json::json!(["homebrew"]));
+    assert_eq!(value["data"]["disabled"], serde_json::json!([]));
+}
+
 #[test]
 fn cli_migrates_v1_config_with_backup_and_stays_idempotent() {
     let home = tempfile::tempdir().unwrap();
+    let bin = tempfile::tempdir().unwrap();
+    write_executable(&bin.path().join("node"), "#!/bin/sh\nprintf 'v26.5.0\\n'\n");
+    write_executable(
+        &bin.path().join("rustc"),
+        "#!/bin/sh\nprintf 'rustc 1.99.0 (fixture)\\n'\n",
+    );
     let path = config_path_for(home.path());
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     let original = "# preserve\nenabled_tools = [\"homebrew\", \"node\", \"rust\"]\npreferred_install_manager = \"homebrew\"\nhistory_limit = 42\ncustom_key = \"keep\"\n";
@@ -292,6 +582,7 @@ fn cli_migrates_v1_config_with_backup_and_stays_idempotent() {
     let first = Command::new(env!("CARGO_BIN_EXE_beacon"))
         .args(["config", "show", "--json"])
         .env("HOME", home.path())
+        .env("PATH", bin.path())
         .output()
         .unwrap();
     assert!(
@@ -300,10 +591,10 @@ fn cli_migrates_v1_config_with_backup_and_stays_idempotent() {
         String::from_utf8_lossy(&first.stderr)
     );
     let value: serde_json::Value = serde_json::from_slice(&first.stdout).unwrap();
-    assert_eq!(value["data"]["schema_version"], 2);
+    assert_eq!(value["data"]["schema_version"], 3);
     assert_eq!(
         value["data"]["enabled_tools"],
-        serde_json::json!(["node", "rust"])
+        serde_json::json!(["rust", "node"])
     );
     assert_eq!(
         value["data"]["enabled_inventories"],
@@ -317,7 +608,7 @@ fn cli_migrates_v1_config_with_backup_and_stays_idempotent() {
     assert!(migrated.contains("# preserve"));
     assert!(migrated.contains("custom_key = \"keep\""));
     assert!(migrated.contains("history_limit = 42"));
-    assert!(migrated.contains("schema_version = 2"));
+    assert!(migrated.contains("schema_version = 3"));
     assert!(migrated.contains("enabled_inventories = [\"homebrew\"]"));
     assert!(!migrated.contains("preferred_install_manager"));
     assert!(
@@ -334,6 +625,7 @@ fn cli_migrates_v1_config_with_backup_and_stays_idempotent() {
     let second = Command::new(env!("CARGO_BIN_EXE_beacon"))
         .args(["config", "show", "--json"])
         .env("HOME", home.path())
+        .env("PATH", bin.path())
         .output()
         .unwrap();
     assert!(second.status.success());
@@ -346,7 +638,7 @@ fn cli_rejects_future_config_schema_without_rewrite() {
     let home = tempfile::tempdir().unwrap();
     let path = config_path_for(home.path());
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-    let original = "schema_version = 3\nenabled_tools = [\"node\"]\n";
+    let original = "schema_version = 4\nenabled_tools = [\"node\"]\n";
     std::fs::write(&path, original).unwrap();
 
     let json = Command::new(env!("CARGO_BIN_EXE_beacon"))
@@ -364,7 +656,7 @@ fn cli_rejects_future_config_schema_without_rewrite() {
         value["errors"][0]["message"]
             .as_str()
             .unwrap()
-            .contains("unsupported Beacon config schema version 3")
+            .contains("unsupported Beacon config schema version 4")
     );
 
     let human = Command::new(env!("CARGO_BIN_EXE_beacon"))
@@ -375,7 +667,7 @@ fn cli_rejects_future_config_schema_without_rewrite() {
     assert_eq!(human.status.code(), Some(1));
     let stderr = String::from_utf8_lossy(&human.stderr);
     assert!(
-        stderr.contains("unsupported Beacon config schema version 3"),
+        stderr.contains("unsupported Beacon config schema version 4"),
         "stderr={stderr}"
     );
 
@@ -391,6 +683,7 @@ fn partial_check_returns_structured_json_and_exit_two() {
 
     let home = tempfile::tempdir().unwrap();
     let path = tempfile::tempdir().unwrap();
+    write_v3_config(home.path(), &["node"]);
     let node = path.path().join("node");
     std::fs::write(&node, "#!/bin/sh\nprintf 'not-a-version\\n'\n").unwrap();
     std::fs::set_permissions(&node, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -922,6 +1215,7 @@ fn uv_report(value: &serde_json::Value) -> &serde_json::Value {
 fn missing_uv_has_no_latest_or_upgrade_action() {
     let home = tempfile::tempdir().unwrap();
     let path = tempfile::tempdir().unwrap();
+    write_v3_config(home.path(), &["uv"]);
 
     let check = Command::new(env!("CARGO_BIN_EXE_beacon"))
         .args(["check", "--json"])

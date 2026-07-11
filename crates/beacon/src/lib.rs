@@ -453,26 +453,32 @@ pub mod config {
         #[serde(default = "missing_schema_version")]
         pub schema_version: u8,
         pub enabled_tools: Vec<String>,
+        pub disabled_tools: Vec<String>,
         pub enabled_inventories: Vec<String>,
+        pub disabled_inventories: Vec<String>,
+        pub tool_catalog_version: u32,
         pub history_limit: usize,
         pub command_timeout_seconds: u64,
+    }
+
+    pub const TOOL_CATALOG_VERSION: u32 = 1;
+
+    pub fn tool_catalog_entry_version(id: &str) -> u32 {
+        match id {
+            "rust" | "node" | "npm" | "pnpm" | "go" | "bun" | "deno" | "uv" => 1,
+            _ => TOOL_CATALOG_VERSION,
+        }
     }
 
     impl Default for Config {
         fn default() -> Self {
             Self {
-                schema_version: 2,
-                enabled_tools: vec![
-                    "rust".into(),
-                    "node".into(),
-                    "npm".into(),
-                    "pnpm".into(),
-                    "go".into(),
-                    "bun".into(),
-                    "deno".into(),
-                    "uv".into(),
-                ],
-                enabled_inventories: vec!["homebrew".into()],
+                schema_version: 3,
+                enabled_tools: Vec::new(),
+                disabled_tools: Vec::new(),
+                enabled_inventories: Vec::new(),
+                disabled_inventories: Vec::new(),
+                tool_catalog_version: 0,
                 history_limit: 500,
                 command_timeout_seconds: 120,
             }
@@ -499,8 +505,8 @@ pub mod config {
         let config: Config =
             toml::from_str(&fs::read_to_string(path)?).context("invalid Beacon config")?;
         match config.schema_version {
-            2 => Ok(config),
-            version if version > 2 => bail!("unsupported Beacon config schema version {version}"),
+            3 => Ok(config),
+            version if version > 3 => bail!("unsupported Beacon config schema version {version}"),
             version => bail!("Beacon config schema version {version} requires migration"),
         }
     }
@@ -511,7 +517,31 @@ pub mod config {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        atomic_write(path, toml::to_string_pretty(config)?.as_bytes())?;
+        if path.exists() {
+            use toml_edit::{Array, DocumentMut, value};
+
+            let mut document = fs::read_to_string(path)?
+                .parse::<DocumentMut>()
+                .context("invalid Beacon config")?;
+            let array = |items: &[String]| {
+                let mut array = Array::new();
+                for item in items {
+                    array.push(item.as_str());
+                }
+                array
+            };
+            document["schema_version"] = value(config.schema_version as i64);
+            document["enabled_tools"] = value(array(&config.enabled_tools));
+            document["disabled_tools"] = value(array(&config.disabled_tools));
+            document["enabled_inventories"] = value(array(&config.enabled_inventories));
+            document["disabled_inventories"] = value(array(&config.disabled_inventories));
+            document["tool_catalog_version"] = value(config.tool_catalog_version as i64);
+            document["history_limit"] = value(config.history_limit as i64);
+            document["command_timeout_seconds"] = value(config.command_timeout_seconds as i64);
+            atomic_write(path, document.to_string().as_bytes())?;
+        } else {
+            atomic_write(path, toml::to_string_pretty(config)?.as_bytes())?;
+        }
         Ok(())
     }
 
@@ -536,10 +566,10 @@ pub mod config {
             .get("schema_version")
             .and_then(|item| item.as_integer())
             .unwrap_or(1);
-        if version > 2 {
+        if version > 3 {
             bail!("unsupported Beacon config schema version {version}");
         }
-        if version == 2 {
+        if version >= 2 {
             return Ok(());
         }
 
@@ -562,7 +592,7 @@ pub mod config {
             }
         } else {
             homebrew_was_enabled = true;
-            for tool in Config::default().enabled_tools {
+            for tool in ["rust", "node", "npm", "pnpm", "go", "bun", "deno", "uv"] {
                 tools.push(tool);
             }
         }
@@ -577,6 +607,75 @@ pub mod config {
         atomic_write(path, document.to_string().as_bytes())?;
         Ok(())
     }
+
+    fn migrate_v2(path: &Path, source: &str) -> Result<()> {
+        use toml_edit::{Array, DocumentMut, value};
+
+        let mut document = source
+            .parse::<DocumentMut>()
+            .context("invalid Beacon config")?;
+        let version = document
+            .get("schema_version")
+            .and_then(|item| item.as_integer())
+            .unwrap_or(1);
+        if version > 3 {
+            bail!("unsupported Beacon config schema version {version}");
+        }
+        if version != 2 {
+            return Ok(());
+        }
+
+        let backup = path.with_file_name("config.toml.v2.bak");
+        if !backup.exists() {
+            atomic_write(&backup, source.as_bytes())?;
+        }
+        let homebrew_enabled = document
+            .get("enabled_inventories")
+            .and_then(|item| item.as_array())
+            .is_some_and(|items| items.iter().any(|item| item.as_str() == Some("homebrew")));
+        let mut disabled_inventories = Array::new();
+        if !homebrew_enabled {
+            disabled_inventories.push("homebrew");
+        }
+        document["schema_version"] = value(3);
+        document["disabled_tools"] = value(Array::new());
+        document["disabled_inventories"] = value(disabled_inventories);
+        document["tool_catalog_version"] = value(0);
+        atomic_write(path, document.to_string().as_bytes())?;
+        Ok(())
+    }
+
+    pub fn initialize_catalog(
+        config: &mut Config,
+        available_tools: &[String],
+        available_inventories: &[String],
+    ) -> bool {
+        if config.tool_catalog_version >= TOOL_CATALOG_VERSION {
+            return false;
+        }
+        if config.tool_catalog_version == 0 {
+            config.enabled_tools = available_tools
+                .iter()
+                .filter(|id| !config.disabled_tools.contains(id))
+                .cloned()
+                .collect();
+        } else {
+            for id in available_tools {
+                let introduced_in = tool_catalog_entry_version(id);
+                if introduced_in > config.tool_catalog_version
+                    && !config.disabled_tools.contains(id)
+                    && !config.enabled_tools.contains(id)
+                {
+                    config.enabled_tools.push(id.clone());
+                }
+            }
+        }
+        if config.enabled_inventories.is_empty() && config.disabled_inventories.is_empty() {
+            config.enabled_inventories = available_inventories.to_vec();
+        }
+        config.tool_catalog_version = TOOL_CATALOG_VERSION;
+        true
+    }
     pub fn ensure() -> Result<(Config, PathBuf)> {
         let path = path()?;
         ensure_at(&path)
@@ -586,6 +685,8 @@ pub mod config {
         if path.exists() {
             let source = fs::read_to_string(path)?;
             migrate_v1(path, &source)?;
+            let source = fs::read_to_string(path)?;
+            migrate_v2(path, &source)?;
         }
         let config = load_from(path)?;
         if !path.exists() {

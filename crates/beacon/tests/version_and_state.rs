@@ -14,20 +14,20 @@ fn parses_versions_from_supported_tool_outputs() {
 }
 
 #[test]
-fn default_config_is_fresh_v2_with_tools_and_homebrew_inventory() {
+fn default_config_is_uninitialized_v3_until_the_cli_discovers_the_environment() {
     let config = Config::default();
-    assert_eq!(config.schema_version, 2);
-    assert_eq!(
-        config.enabled_tools,
-        ["rust", "node", "npm", "pnpm", "go", "bun", "deno", "uv"]
-    );
-    assert_eq!(config.enabled_inventories, ["homebrew"]);
+    assert_eq!(config.schema_version, 3);
+    assert!(config.enabled_tools.is_empty());
+    assert!(config.disabled_tools.is_empty());
+    assert!(config.enabled_inventories.is_empty());
+    assert!(config.disabled_inventories.is_empty());
+    assert_eq!(config.tool_catalog_version, 0);
     assert_eq!(config.history_limit, 500);
     assert_eq!(config.command_timeout_seconds, 120);
 }
 
 #[test]
-fn ensure_writes_fresh_v2_config_when_missing() {
+fn ensure_writes_fresh_uninitialized_v3_config_when_missing() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("config.toml");
 
@@ -35,19 +35,13 @@ fn ensure_writes_fresh_v2_config_when_missing() {
     let written = std::fs::read_to_string(&path).unwrap();
 
     assert_eq!(returned, path);
-    assert_eq!(config.schema_version, 2);
-    assert_eq!(
-        config.enabled_tools,
-        ["rust", "node", "npm", "pnpm", "go", "bun", "deno", "uv"]
-    );
-    assert_eq!(config.enabled_inventories, ["homebrew"]);
-    assert!(written.contains("schema_version = 2"));
+    assert_eq!(config.schema_version, 3);
+    assert!(config.enabled_tools.is_empty());
+    assert!(config.enabled_inventories.is_empty());
+    assert!(written.contains("schema_version = 3"));
     assert!(written.contains("enabled_tools"));
     assert!(written.contains("enabled_inventories"));
-    assert!(written.contains("\"bun\""));
-    assert!(written.contains("\"deno\""));
-    assert!(written.contains("\"uv\""));
-    assert!(written.contains("\"homebrew\""));
+    assert!(written.contains("tool_catalog_version = 0"));
     assert!(!path.with_file_name("config.toml.tmp").exists());
     assert!(!directory.path().join("config.toml.v1.bak").exists());
 }
@@ -131,7 +125,7 @@ fn config_v1_migration_preserves_comments_and_unknown_keys() {
     let migrated = std::fs::read_to_string(&path).unwrap();
     let backup = std::fs::read_to_string(directory.path().join("config.toml.v1.bak")).unwrap();
 
-    assert_eq!(config.schema_version, 2);
+    assert_eq!(config.schema_version, 3);
     assert_eq!(config.enabled_tools, ["node"]);
     assert_eq!(config.enabled_inventories, ["homebrew"]);
     assert!(migrated.contains("# keep this comment"));
@@ -161,7 +155,7 @@ fn config_v1_migration_moves_homebrew_and_keeps_valid_settings() {
     let migrated = std::fs::read_to_string(&path).unwrap();
     let backup = std::fs::read_to_string(directory.path().join("config.toml.v1.bak")).unwrap();
 
-    assert_eq!(config.schema_version, 2);
+    assert_eq!(config.schema_version, 3);
     assert_eq!(config.enabled_tools, ["node", "rust"]);
     assert_eq!(config.enabled_inventories, ["homebrew"]);
     assert_eq!(config.history_limit, 42);
@@ -183,6 +177,7 @@ fn config_v1_migration_preserves_disabled_homebrew_inventory() {
     let (config, _) = beacon::config::ensure_at(&path).unwrap();
 
     assert!(config.enabled_inventories.is_empty());
+    assert_eq!(config.disabled_inventories, ["homebrew"]);
 }
 
 #[test]
@@ -202,11 +197,14 @@ fn config_v1_migration_without_enabled_tools_uses_fresh_defaults() {
     let migrated = std::fs::read_to_string(&path).unwrap();
     let backup = std::fs::read_to_string(directory.path().join("config.toml.v1.bak")).unwrap();
 
-    assert_eq!(config.schema_version, 2);
-    assert_eq!(config.enabled_tools, Config::default().enabled_tools);
+    assert_eq!(config.schema_version, 3);
+    assert_eq!(
+        config.enabled_tools,
+        ["rust", "node", "npm", "pnpm", "go", "bun", "deno", "uv"]
+    );
     assert_eq!(config.enabled_inventories, ["homebrew"]);
     assert_eq!(config.history_limit, 10);
-    assert!(migrated.contains("schema_version = 2"));
+    assert!(migrated.contains("schema_version = 3"));
     assert!(migrated.contains("enabled_tools"));
     assert!(migrated.contains("enabled_inventories = [\"homebrew\"]"));
     assert!(migrated.contains("\"bun\""));

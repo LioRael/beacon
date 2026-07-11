@@ -52,10 +52,7 @@ impl Commands {
             Self::Upgrade(args) => args.json,
             Self::Doctor(args) => args.json,
             Self::History(args) => args.json,
-            Self::Config {
-                command: ConfigCommand::Show { json },
-            } => *json,
-            Self::Config { .. } => false,
+            Self::Config { command } => command.json(),
         }
     }
 }
@@ -101,6 +98,52 @@ enum ConfigCommand {
         key: String,
         value: String,
     },
+    Tools(ConfigToolsArgs),
+    Inventories(ConfigInventoriesArgs),
+}
+
+impl ConfigCommand {
+    fn json(&self) -> bool {
+        match self {
+            Self::Show { json } => *json,
+            Self::Tools(args) => args.json,
+            Self::Inventories(args) => args.json,
+            _ => false,
+        }
+    }
+}
+
+#[derive(Args)]
+struct ConfigToolsArgs {
+    #[arg(long, global = true)]
+    json: bool,
+    #[command(subcommand)]
+    command: Option<ToolConfigCommand>,
+}
+
+#[derive(Subcommand)]
+enum ToolConfigCommand {
+    Edit,
+    Enable { tools: Vec<String> },
+    Disable { tools: Vec<String> },
+    Sync,
+    Reset,
+}
+
+#[derive(Args)]
+struct ConfigInventoriesArgs {
+    #[arg(long, global = true)]
+    json: bool,
+    #[command(subcommand)]
+    command: Option<InventoryConfigCommand>,
+}
+
+#[derive(Subcommand)]
+enum InventoryConfigCommand {
+    Edit,
+    Enable { inventories: Vec<String> },
+    Disable { inventories: Vec<String> },
+    Reset,
 }
 
 #[derive(Debug, Clone)]
@@ -123,6 +166,33 @@ struct UpgradeResult {
     update_manager: String,
     status: String,
     action: providers::UpgradeAction,
+}
+
+#[derive(Serialize)]
+struct ConfigChange {
+    config_path: String,
+    before: Vec<String>,
+    after: Vec<String>,
+    disabled: Vec<String>,
+    added: Vec<String>,
+    removed: Vec<String>,
+    unchanged: Vec<String>,
+    skipped: Vec<ConfigSkipped>,
+}
+
+#[derive(Serialize)]
+struct ConfigSkipped {
+    id: String,
+    reason: String,
+}
+
+#[derive(Serialize)]
+struct ConfigItemStatus {
+    id: String,
+    name: String,
+    enabled: bool,
+    installed: bool,
+    detail: Option<String>,
 }
 
 #[derive(Default)]
@@ -427,27 +497,121 @@ fn set_config(config: &mut Config, key: &str, value: &str) -> Result<()> {
                 .parse()
                 .context("command_timeout_seconds must be a positive integer")?
         }
-        "enabled_tools" => {
-            config.enabled_tools = value
-                .split(',')
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(str::to_string)
-                .collect()
+        "enabled_tools" | "disabled_tools" => {
+            bail!("tool lists are managed with `beacon config tools`")
         }
-        "enabled_inventories" => {
-            config.enabled_inventories = value
-                .split(',')
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(str::to_string)
-                .collect()
+        "enabled_inventories" | "disabled_inventories" => {
+            bail!("inventory lists are managed with `beacon config inventories`")
         }
         "schema_version" => bail!("schema_version cannot be changed manually"),
         _ => bail!("unknown config key `{key}`"),
     }
     if config.history_limit == 0 || config.command_timeout_seconds == 0 {
         bail!("numeric settings must be greater than zero");
+    }
+    Ok(())
+}
+
+fn edit_distance(left: &str, right: &str) -> usize {
+    let mut previous = (0..=right.len()).collect::<Vec<_>>();
+    for (left_index, left_byte) in left.bytes().enumerate() {
+        let mut current = vec![left_index + 1];
+        for (right_index, right_byte) in right.bytes().enumerate() {
+            current.push(std::cmp::min(
+                std::cmp::min(current[right_index] + 1, previous[right_index + 1] + 1),
+                previous[right_index] + usize::from(left_byte != right_byte),
+            ));
+        }
+        previous = current;
+    }
+    previous[right.len()]
+}
+
+fn normalize_ids(values: &[String], supported: &[String], kind: &str) -> Result<Vec<String>> {
+    if values.is_empty() {
+        bail!("at least one {kind} is required");
+    }
+    let mut normalized = Vec::new();
+    for value in values {
+        let candidate = value.to_ascii_lowercase();
+        if !supported.contains(&candidate) {
+            let suggestion = supported
+                .iter()
+                .min_by_key(|supported| edit_distance(&candidate, supported));
+            let hint = suggestion
+                .filter(|suggestion| edit_distance(&candidate, suggestion) <= 2)
+                .map(|suggestion| format!("; did you mean `{suggestion}`?"))
+                .unwrap_or_default();
+            bail!(
+                "unknown {kind} `{value}`{hint} Supported {kind}s: {}",
+                supported.join(", ")
+            );
+        }
+        if !normalized.contains(&candidate) {
+            normalized.push(candidate);
+        }
+    }
+    Ok(normalized)
+}
+
+fn ordered(values: impl IntoIterator<Item = String>, supported: &[String]) -> Vec<String> {
+    let values = values.into_iter().collect::<Vec<_>>();
+    supported
+        .iter()
+        .filter(|id| values.contains(id))
+        .cloned()
+        .collect()
+}
+
+fn config_change(
+    path: &std::path::Path,
+    before: &[String],
+    enabled: &[String],
+    disabled: &[String],
+    touched: &[String],
+    skipped: Vec<ConfigSkipped>,
+) -> ConfigChange {
+    ConfigChange {
+        config_path: path.display().to_string(),
+        before: before.to_vec(),
+        after: enabled.to_vec(),
+        disabled: disabled.to_vec(),
+        added: enabled
+            .iter()
+            .filter(|id| !before.contains(id))
+            .cloned()
+            .collect(),
+        removed: before
+            .iter()
+            .filter(|id| !enabled.contains(id))
+            .cloned()
+            .collect(),
+        unchanged: touched
+            .iter()
+            .filter(|id| before.contains(id) == enabled.contains(id))
+            .cloned()
+            .collect(),
+        skipped,
+    }
+}
+
+fn print_config_change(change: &ConfigChange, json: bool) -> Result<()> {
+    if json {
+        print_envelope(&Envelope::ok(change))?;
+    } else {
+        if !change.added.is_empty() {
+            println!("Enabled: {}", change.added.join(", "));
+        }
+        if !change.removed.is_empty() {
+            println!("Disabled: {}", change.removed.join(", "));
+        }
+        if change.added.is_empty() && change.removed.is_empty() {
+            println!("No configuration changes.");
+        }
+        for skipped in &change.skipped {
+            println!("Skipped {}: {}", skipped.id, skipped.reason);
+        }
+        println!("Config: {}", change.config_path);
     }
     Ok(())
 }
@@ -550,7 +714,40 @@ async fn main() {
 }
 
 async fn run(cli: Cli) -> Result<i32> {
+    let config_was_missing = !config::path()?.exists();
+    let human_output = !cli.command.json();
     let (mut config, config_path) = config::ensure()?;
+    if config.tool_catalog_version < config::TOOL_CATALOG_VERSION {
+        let ui = Ui::new(true, cli.verbose, cli.no_color);
+        let pending_tools = providers::tool_registry()
+            .iter()
+            .map(|adapter| adapter.id().to_string())
+            .filter(|id| {
+                config.tool_catalog_version == 0
+                    || config::tool_catalog_entry_version(id) > config.tool_catalog_version
+            })
+            .collect::<Vec<_>>();
+        let probes = providers::probe_tools_for(&config, &ui, &pending_tools).await;
+        let available_tools = probes
+            .iter()
+            .filter(|probe| probe.available)
+            .map(|probe| probe.id.clone())
+            .collect::<Vec<_>>();
+        let available_inventories = if config.tool_catalog_version == 0 {
+            providers::available_inventories(&config, &ui).await
+        } else {
+            Vec::new()
+        };
+        if config::initialize_catalog(&mut config, &available_tools, &available_inventories) {
+            config::save_to(&config, &config_path)?;
+            if config_was_missing && human_output {
+                eprintln!(
+                    "Initialized Beacon config at {}. Run `beacon config tools edit` to change monitored tools.",
+                    config_path.display()
+                );
+            }
+        }
+    }
     let (db_path, log_path) = paths()?;
     let store = Store::open(&db_path)?;
     match cli.command {
@@ -838,6 +1035,312 @@ async fn run(cli: Cli) -> Result<i32> {
                 set_config(&mut config, &key, &value)?;
                 config::save_to(&config, &config_path)?;
                 println!("Updated {key}.");
+            }
+            ConfigCommand::Tools(args) => {
+                let supported = providers::tool_registry()
+                    .iter()
+                    .map(|adapter| adapter.id().to_string())
+                    .collect::<Vec<_>>();
+                match args.command {
+                    None => {
+                        let ui = Ui::new(args.json, cli.verbose, cli.no_color);
+                        let probes = providers::probe_tools(&config, &ui).await;
+                        let items = probes
+                            .into_iter()
+                            .map(|probe| ConfigItemStatus {
+                                enabled: config.enabled_tools.contains(&probe.id),
+                                installed: probe.available,
+                                id: probe.id,
+                                name: probe.name,
+                                detail: probe.detail,
+                            })
+                            .collect::<Vec<_>>();
+                        if args.json {
+                            print_envelope(&Envelope::ok(items))?;
+                        } else {
+                            println!("{:<10} {:<18} {:<10} INSTALLED", "ID", "TOOL", "ENABLED");
+                            for item in items {
+                                println!(
+                                    "{:<10} {:<18} {:<10} {}",
+                                    item.id,
+                                    item.name,
+                                    if item.enabled { "yes" } else { "no" },
+                                    if item.installed { "yes" } else { "no" }
+                                );
+                            }
+                        }
+                    }
+                    Some(ToolConfigCommand::Enable { tools }) => {
+                        let tools = normalize_ids(&tools, &supported, "tool")?;
+                        let before = config.enabled_tools.clone();
+                        config.disabled_tools.retain(|id| !tools.contains(id));
+                        config.enabled_tools = ordered(
+                            config
+                                .enabled_tools
+                                .into_iter()
+                                .chain(tools.iter().cloned()),
+                            &supported,
+                        );
+                        config::save_to(&config, &config_path)?;
+                        let change = config_change(
+                            &config_path,
+                            &before,
+                            &config.enabled_tools,
+                            &config.disabled_tools,
+                            &tools,
+                            Vec::new(),
+                        );
+                        print_config_change(&change, args.json)?;
+                    }
+                    Some(ToolConfigCommand::Disable { tools }) => {
+                        let tools = normalize_ids(&tools, &supported, "tool")?;
+                        let before = config.enabled_tools.clone();
+                        config.enabled_tools.retain(|id| !tools.contains(id));
+                        config.disabled_tools = ordered(
+                            config
+                                .disabled_tools
+                                .into_iter()
+                                .chain(tools.iter().cloned()),
+                            &supported,
+                        );
+                        config::save_to(&config, &config_path)?;
+                        let change = config_change(
+                            &config_path,
+                            &before,
+                            &config.enabled_tools,
+                            &config.disabled_tools,
+                            &tools,
+                            Vec::new(),
+                        );
+                        print_config_change(&change, args.json)?;
+                    }
+                    Some(ToolConfigCommand::Sync) => {
+                        let ui = Ui::new(args.json, cli.verbose, cli.no_color);
+                        let probes = providers::probe_tools(&config, &ui).await;
+                        let before = config.enabled_tools.clone();
+                        let mut candidates = config.enabled_tools.clone();
+                        let mut skipped = Vec::new();
+                        for probe in probes {
+                            if !probe.available {
+                                skipped.push(ConfigSkipped {
+                                    id: probe.id,
+                                    reason: probe.detail.unwrap_or_else(|| "not available".into()),
+                                });
+                            } else if config.disabled_tools.contains(&probe.id) {
+                                skipped.push(ConfigSkipped {
+                                    id: probe.id,
+                                    reason: "explicitly disabled".into(),
+                                });
+                            } else {
+                                candidates.push(probe.id);
+                            }
+                        }
+                        config.enabled_tools = ordered(candidates, &supported);
+                        config::save_to(&config, &config_path)?;
+                        let change = config_change(
+                            &config_path,
+                            &before,
+                            &config.enabled_tools,
+                            &config.disabled_tools,
+                            &supported,
+                            skipped,
+                        );
+                        print_config_change(&change, args.json)?;
+                    }
+                    Some(ToolConfigCommand::Reset) => {
+                        let ui = Ui::new(args.json, cli.verbose, cli.no_color);
+                        let probes = providers::probe_tools(&config, &ui).await;
+                        let before = config.enabled_tools.clone();
+                        config.enabled_tools = probes
+                            .iter()
+                            .filter(|probe| probe.available)
+                            .map(|probe| probe.id.clone())
+                            .collect();
+                        config.disabled_tools.clear();
+                        config::save_to(&config, &config_path)?;
+                        let change = config_change(
+                            &config_path,
+                            &before,
+                            &config.enabled_tools,
+                            &config.disabled_tools,
+                            &supported,
+                            Vec::new(),
+                        );
+                        print_config_change(&change, args.json)?;
+                    }
+                    Some(ToolConfigCommand::Edit) => {
+                        if args.json
+                            || !std::io::stdin().is_terminal()
+                            || !std::io::stdout().is_terminal()
+                        {
+                            bail!("`beacon config tools edit` requires an interactive terminal");
+                        }
+                        let labels = providers::tool_registry()
+                            .iter()
+                            .map(|adapter| format!("{} ({})", adapter.display_name(), adapter.id()))
+                            .collect::<Vec<_>>();
+                        let defaults = supported
+                            .iter()
+                            .map(|id| config.enabled_tools.contains(id))
+                            .collect::<Vec<_>>();
+                        let selected = MultiSelect::new()
+                            .with_prompt("Select tools to monitor")
+                            .items(&labels)
+                            .defaults(&defaults)
+                            .interact()?;
+                        let before = config.enabled_tools.clone();
+                        config.enabled_tools = selected
+                            .iter()
+                            .map(|index| supported[*index].clone())
+                            .collect();
+                        config.disabled_tools = supported
+                            .iter()
+                            .filter(|id| !config.enabled_tools.contains(id))
+                            .cloned()
+                            .collect();
+                        config::save_to(&config, &config_path)?;
+                        let change = config_change(
+                            &config_path,
+                            &before,
+                            &config.enabled_tools,
+                            &config.disabled_tools,
+                            &supported,
+                            Vec::new(),
+                        );
+                        print_config_change(&change, false)?;
+                    }
+                }
+            }
+            ConfigCommand::Inventories(args) => {
+                let supported = vec!["homebrew".to_string()];
+                match args.command {
+                    None => {
+                        let ui = Ui::new(args.json, cli.verbose, cli.no_color);
+                        let available = providers::available_inventories(&config, &ui).await;
+                        let items = vec![ConfigItemStatus {
+                            id: "homebrew".into(),
+                            name: "Homebrew".into(),
+                            enabled: config.enabled_inventories.iter().any(|id| id == "homebrew"),
+                            installed: available.iter().any(|id| id == "homebrew"),
+                            detail: None,
+                        }];
+                        if args.json {
+                            print_envelope(&Envelope::ok(items))?;
+                        } else {
+                            println!(
+                                "{:<12} {:<18} {:<10} INSTALLED",
+                                "ID", "INVENTORY", "ENABLED"
+                            );
+                            for item in items {
+                                println!(
+                                    "{:<12} {:<18} {:<10} {}",
+                                    item.id,
+                                    item.name,
+                                    if item.enabled { "yes" } else { "no" },
+                                    if item.installed { "yes" } else { "no" }
+                                );
+                            }
+                        }
+                    }
+                    Some(InventoryConfigCommand::Enable { inventories }) => {
+                        let inventories = normalize_ids(&inventories, &supported, "inventory")?;
+                        let before = config.enabled_inventories.clone();
+                        config
+                            .disabled_inventories
+                            .retain(|id| !inventories.contains(id));
+                        config.enabled_inventories = ordered(
+                            config
+                                .enabled_inventories
+                                .into_iter()
+                                .chain(inventories.iter().cloned()),
+                            &supported,
+                        );
+                        config::save_to(&config, &config_path)?;
+                        let change = config_change(
+                            &config_path,
+                            &before,
+                            &config.enabled_inventories,
+                            &config.disabled_inventories,
+                            &inventories,
+                            Vec::new(),
+                        );
+                        print_config_change(&change, args.json)?;
+                    }
+                    Some(InventoryConfigCommand::Disable { inventories }) => {
+                        let inventories = normalize_ids(&inventories, &supported, "inventory")?;
+                        let before = config.enabled_inventories.clone();
+                        config
+                            .enabled_inventories
+                            .retain(|id| !inventories.contains(id));
+                        config.disabled_inventories = ordered(
+                            config
+                                .disabled_inventories
+                                .into_iter()
+                                .chain(inventories.iter().cloned()),
+                            &supported,
+                        );
+                        config::save_to(&config, &config_path)?;
+                        let change = config_change(
+                            &config_path,
+                            &before,
+                            &config.enabled_inventories,
+                            &config.disabled_inventories,
+                            &inventories,
+                            Vec::new(),
+                        );
+                        print_config_change(&change, args.json)?;
+                    }
+                    Some(InventoryConfigCommand::Reset) => {
+                        let before = config.enabled_inventories.clone();
+                        config.enabled_inventories = supported.clone();
+                        config.disabled_inventories.clear();
+                        config::save_to(&config, &config_path)?;
+                        let change = config_change(
+                            &config_path,
+                            &before,
+                            &config.enabled_inventories,
+                            &config.disabled_inventories,
+                            &supported,
+                            Vec::new(),
+                        );
+                        print_config_change(&change, args.json)?;
+                    }
+                    Some(InventoryConfigCommand::Edit) => {
+                        if args.json
+                            || !std::io::stdin().is_terminal()
+                            || !std::io::stdout().is_terminal()
+                        {
+                            bail!(
+                                "`beacon config inventories edit` requires an interactive terminal"
+                            );
+                        }
+                        let defaults =
+                            vec![config.enabled_inventories.iter().any(|id| id == "homebrew")];
+                        let selected = MultiSelect::new()
+                            .with_prompt("Select inventories")
+                            .items(&["Homebrew (homebrew)"])
+                            .defaults(&defaults)
+                            .interact()?;
+                        let before = config.enabled_inventories.clone();
+                        config.enabled_inventories =
+                            selected.iter().map(|_| "homebrew".into()).collect();
+                        config.disabled_inventories = if selected.is_empty() {
+                            vec!["homebrew".into()]
+                        } else {
+                            Vec::new()
+                        };
+                        config::save_to(&config, &config_path)?;
+                        let change = config_change(
+                            &config_path,
+                            &before,
+                            &config.enabled_inventories,
+                            &config.disabled_inventories,
+                            &supported,
+                            Vec::new(),
+                        );
+                        print_config_change(&change, false)?;
+                    }
+                }
             }
         },
     }

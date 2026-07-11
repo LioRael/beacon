@@ -29,11 +29,27 @@ beacon doctor --json
 beacon doctor <targets> --json
 beacon history --json
 beacon config show --json
+beacon config tools --json
+beacon config inventories --json
 ```
 
 Always prefer `--json` machine output. Require `schema_version: 2` and parse the JSON envelope (`status`, `data`, `errors`). Never scrape colored or human terminal tables for decisions. Traverse `data.tools` and `data.inventories` separately. Treat `installation` and `update` as explicitly nullable.
 
-Summarize current, outdated, missing, unmanaged, and failed tools. Preserve `installation.source` separately from `update.manager` in every summary and confirmation; never collapse them into a single "manager". Report missing tools for diagnosis only. Never pass missing or unmanaged tools to `upgrade`.
+Summarize current, outdated, missing, unmanaged, and failed tools. Preserve `installation.source` separately from `update.manager` in every summary and confirmation; never collapse them into a single "manager". `check` reports configured tools, not every supported tool: a missing report means the user explicitly chose to monitor that tool. Report missing tools for diagnosis only. Never pass missing or unmanaged tools to `upgrade`.
+
+When the user asks to change the monitored scope, use the domain commands rather than editing TOML or using list-valued `config set` calls:
+
+```bash
+beacon config tools enable <tools> --json
+beacon config tools disable <tools> --json
+beacon config tools sync --json
+beacon config tools reset --json
+beacon config inventories enable <inventories> --json
+beacon config inventories disable <inventories> --json
+beacon config inventories reset --json
+```
+
+Treat these as state-changing commands and get confirmation when the user has not already requested the change. `sync` adds tools that are executable on the current `PATH` and pass a version probe, but never re-enables an explicitly disabled tool. Configuration schema v3 is distinct from the schema v2 JSON envelope.
 
 Interpret envelope outcomes:
 

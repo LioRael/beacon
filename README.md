@@ -45,10 +45,20 @@ beacon --no-color doctor         # disable ANSI colors
 beacon doctor --json            # inspect PATH, managers, and duplicate sources
 beacon history --limit 20
 beacon config show
+beacon config tools                         # list support, selection, and install state
+beacon config tools enable bun uv
+beacon config tools disable pnpm
+beacon config tools sync                    # add installed tools unless explicitly disabled
+beacon config tools reset                   # redetect installed tools and clear disabled choices
+beacon config tools edit                    # interactive selection
+beacon config inventories
+beacon config inventories disable homebrew
 beacon config set command_timeout_seconds 180
 ```
 
-`upgrade` lists only installed, outdated tools and qualified Homebrew inventory targets. Missing and unmanaged tools remain visible in `check` and `doctor`, but Beacon does not install them through `upgrade`. An upgrade stops on the first command or verification failure and prints manager-specific recovery guidance.
+On first run, Beacon enables only supported tools that are executable on the current `PATH` and pass their version probe. `check` is read-only: tools installed later are added only by `config tools sync`, `enable`, `edit`, or `reset`. A missing tool remains visible only when it was explicitly enabled. `upgrade` lists only installed, outdated tools and qualified Homebrew inventory targets; it never installs missing tools. An upgrade stops on the first command or verification failure and prints manager-specific recovery guidance.
+
+Configuration uses schema v3 and records enabled and explicitly disabled tools separately. Migrating an older configuration removes missing legacy defaults, adds installed supported tools, preserves comments and unknown keys, and writes `config.toml.v2.bak`. Configuration schema versions are independent from the machine-output envelope version.
 
 Machine output always uses a schema v2 envelope with `tools` and `inventories` arrays. Tool `installation` and `update` sections are independently nullable. A successful partial check returns valid JSON and exit code 2 with structured, redacted errors; fatal failures return exit code 1.
 
@@ -71,6 +81,7 @@ update manager stay independent fields across human output, JSON, and local hist
 - Domain vocabulary: [`docs/domain-glossary.md`](docs/domain-glossary.md)
 - ADR 0001 — two-layer provider model: [`docs/adr/0001-two-layer-provider-model.md`](docs/adr/0001-two-layer-provider-model.md)
 - ADR 0002 — JSON and local-state v2: [`docs/adr/0002-schema-and-local-state-v2.md`](docs/adr/0002-schema-and-local-state-v2.md)
+- ADR 0003 — configuration selection and catalog v3: [`docs/adr/0003-config-selection-and-catalog-v3.md`](docs/adr/0003-config-selection-and-catalog-v3.md)
 - Agent Skill (schema v2 contracts): [`skills/beacon/SKILL.md`](skills/beacon/SKILL.md)
 
 ## Development
