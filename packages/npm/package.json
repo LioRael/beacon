@@ -1,6 +1,6 @@
 {
   "name": "@liorael/beacon",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "A conservative macOS development toolchain update manager",
   "license": "MIT",
   "repository": {

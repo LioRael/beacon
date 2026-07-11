@@ -25,9 +25,9 @@ You can also download the Apple Silicon archive from the
 installing:
 
 ```bash
-shasum -a 256 -c beacon-v0.3.0-aarch64-apple-darwin.tar.gz.sha256
-tar -xzf beacon-v0.3.0-aarch64-apple-darwin.tar.gz
-install -m 755 beacon-v0.3.0-aarch64-apple-darwin/beacon /usr/local/bin/beacon
+shasum -a 256 -c beacon-v0.3.1-aarch64-apple-darwin.tar.gz.sha256
+tar -xzf beacon-v0.3.1-aarch64-apple-darwin.tar.gz
+install -m 755 beacon-v0.3.1-aarch64-apple-darwin/beacon /usr/local/bin/beacon
 ```
 
 Prebuilt binaries require Apple Silicon and macOS 15 Sequoia or newer. Installing from Cargo
@@ -91,7 +91,7 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 node --test packages/npm/test/*.test.mjs tests/*.test.mjs
-node scripts/verify-release-version.mjs v0.3.0
+node scripts/verify-release-version.mjs v0.3.1
 ```
 
 ## Distribution setup
