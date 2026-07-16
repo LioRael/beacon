@@ -280,10 +280,10 @@ pub mod ui {
 
     impl FeedbackMode {
         pub fn select(is_tty: bool, json: bool, verbose: bool) -> Self {
-            if verbose {
-                Self::Verbose
-            } else if json {
+            if json {
                 Self::Silent
+            } else if verbose {
+                Self::Verbose
             } else if is_tty {
                 Self::Spinner
             } else {
@@ -372,8 +372,8 @@ pub mod ui {
                     bar.enable_steady_tick(Duration::from_millis(80));
                     progress.bar = Some(bar);
                 }
-                FeedbackMode::Plain => eprintln!("… {label}"),
-                FeedbackMode::Silent | FeedbackMode::Verbose => {}
+                FeedbackMode::Plain | FeedbackMode::Verbose => eprintln!("… {label}"),
+                FeedbackMode::Silent => {}
             }
         }
 
@@ -847,7 +847,11 @@ pub mod config {
 pub mod runner {
     use crate::command::CommandSpec;
     use anyhow::{Context, Result, bail};
-    use std::{io::Write, process::Stdio, time::Duration};
+    use std::{
+        io::{Read, Seek, Write},
+        process::Stdio,
+        time::Duration,
+    };
     use tokio::{
         io::{AsyncRead, AsyncReadExt},
         process::Command,
@@ -860,8 +864,70 @@ pub mod runner {
         pub stderr: String,
     }
 
+    fn prepare_command(spec: &CommandSpec) -> Command {
+        let mut command = Command::new(&spec.program);
+        command
+            .args(&spec.args)
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        if let Some(path) = &spec.current_dir {
+            command.current_dir(path);
+        }
+        command.envs(&spec.environment);
+        for key in &spec.removed_environment {
+            command.env_remove(key);
+        }
+        command
+    }
+
+    fn command_output(
+        spec: &CommandSpec,
+        status: std::process::ExitStatus,
+        stdout: Vec<u8>,
+        stderr: Vec<u8>,
+        home: Option<&str>,
+    ) -> Result<CommandOutput> {
+        let stdout = String::from_utf8_lossy(&stdout).trim().to_string();
+        let stderr = String::from_utf8_lossy(&stderr).trim().to_string();
+        if !status.success()
+            && !status
+                .code()
+                .is_some_and(|code| spec.accepted_exit_codes.contains(&code))
+        {
+            let message = format!("{} failed ({}): {}", spec.display(), status, stderr);
+            bail!("{}", crate::redact::redact(&message, home));
+        }
+        Ok(CommandOutput { stdout, stderr })
+    }
+
     pub async fn run(spec: &CommandSpec, seconds: u64) -> Result<CommandOutput> {
         run_with_output(spec, seconds, false).await
+    }
+
+    /// Captures machine output through a regular file so package CLIs that force an early
+    /// process exit cannot lose buffered JSON at the stdout pipe boundary.
+    pub async fn run_machine_output(spec: &CommandSpec, seconds: u64) -> Result<CommandOutput> {
+        let mut stdout_file = tempfile::tempfile()?;
+        let mut command = prepare_command(spec);
+        command.stdout(Stdio::from(stdout_file.try_clone()?));
+        let mut child = command.spawn()?;
+        let stderr = child
+            .stderr
+            .take()
+            .context("failed to capture command stderr")?;
+        let home = std::env::var("HOME").ok();
+        let (status, stderr) = timeout(Duration::from_secs(seconds), async {
+            tokio::try_join!(
+                async { Ok::<_, anyhow::Error>(child.wait().await?) },
+                capture(stderr, false, home.as_deref())
+            )
+        })
+        .await
+        .with_context(|| format!("command timed out: {}", spec.display()))??;
+        stdout_file.rewind()?;
+        let mut stdout = Vec::new();
+        stdout_file.read_to_end(&mut stdout)?;
+        command_output(spec, status, stdout, stderr, home.as_deref())
     }
 
     pub fn sanitize_verbose_line(line: &str, home: Option<&str>) -> String {
@@ -1004,19 +1070,8 @@ pub mod runner {
         seconds: u64,
         verbose: bool,
     ) -> Result<CommandOutput> {
-        let mut command = Command::new(&spec.program);
-        command
-            .args(&spec.args)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-        if let Some(path) = &spec.current_dir {
-            command.current_dir(path);
-        }
-        command.envs(&spec.environment);
-        for key in &spec.removed_environment {
-            command.env_remove(key);
-        }
+        let mut command = prepare_command(spec);
+        command.stdout(Stdio::piped());
         let mut child = command.spawn()?;
         let stdout = child
             .stdout
@@ -1036,17 +1091,7 @@ pub mod runner {
         })
         .await
         .with_context(|| format!("command timed out: {}", spec.display()))??;
-        let stdout = String::from_utf8_lossy(&stdout).trim().to_string();
-        let stderr = String::from_utf8_lossy(&stderr).trim().to_string();
-        if !status.success()
-            && !status
-                .code()
-                .is_some_and(|code| spec.accepted_exit_codes.contains(&code))
-        {
-            let message = format!("{} failed ({}): {}", spec.display(), status, stderr);
-            bail!("{}", crate::redact::redact(&message, home.as_deref()));
-        }
-        Ok(CommandOutput { stdout, stderr })
+        command_output(spec, status, stdout, stderr, home.as_deref())
     }
 
     #[cfg(test)]

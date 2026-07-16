@@ -7,6 +7,7 @@ struct Fixture {
     home: tempfile::TempDir,
     bin: std::path::PathBuf,
     skill: std::path::PathBuf,
+    runner_log: std::path::PathBuf,
 }
 
 impl Fixture {
@@ -14,6 +15,7 @@ impl Fixture {
         let home = tempfile::tempdir().unwrap();
         let bin = home.path().join("bin");
         let skill = home.path().join(".agents/skills/demo");
+        let runner_log = home.path().join("runner.log");
         std::fs::create_dir_all(&bin).unwrap();
         std::fs::create_dir_all(&skill).unwrap();
         std::fs::write(skill.join("SKILL.md"), "before\n").unwrap();
@@ -27,9 +29,11 @@ impl Fixture {
         let script = format!(
             r#"#!/bin/sh
 test "$DISABLE_TELEMETRY" = 1 || {{ echo telemetry-was-not-disabled >&2; exit 70; }}
+printf '%s\n' "$*" >> "{}"
 case "$*" in
   "--version") echo '11.17.0' ;;
   "--yes skills@^1.5.18 --version") echo 'skills {version}' ;;
+  "--yes skills@^1.5.18 list --json") printf '[]\n' ;;
   "--yes skills@^1.5.18 list --global --json") printf '[{{"name":"demo","path":"{}","scope":"global","agents":["codex","claude"]}}]\n' ;;
   "--yes skills@^1.5.18 update demo --global --yes")
     mkdir -p "$HOME/.agents/skills/demo"
@@ -38,13 +42,19 @@ case "$*" in
   *) echo "unexpected: $*" >&2; exit 64 ;;
 esac
 "#,
+            runner_log.display(),
             skill.display()
         );
         let executable = bin.join("npx");
         std::fs::write(&executable, script).unwrap();
         std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
         write_config(home.path(), &["skills"]);
-        Self { home, bin, skill }
+        Self {
+            home,
+            bin,
+            skill,
+            runner_log,
+        }
     }
 
     fn beacon(&self) -> Command {
@@ -125,6 +135,116 @@ fn check_uses_an_isolated_mirror_and_reports_scoped_file_changes() {
         ])
     );
     assert!(report.get("agents").is_none());
+}
+
+#[test]
+fn check_lists_global_skills_once() {
+    let fixture = Fixture::new("github", "1.5.18");
+    let (status, value) = check(&fixture);
+
+    assert!(status.success(), "{value}");
+    let global_lists = std::fs::read_to_string(&fixture.runner_log)
+        .unwrap()
+        .lines()
+        .filter(|line| *line == "--yes skills@^1.5.18 list --global --json")
+        .count();
+    assert_eq!(
+        global_lists, 1,
+        "global Skill discovery must not be repeated"
+    );
+}
+
+#[test]
+fn check_reads_large_skills_json_completely() {
+    let fixture = Fixture::new("github", "1.5.18");
+    let node = Command::new("/usr/bin/which").arg("node").output().unwrap();
+    assert!(
+        node.status.success(),
+        "Node.js is required by the Skills package"
+    );
+    let node = String::from_utf8(node.stdout).unwrap().trim().to_string();
+    let writer = fixture.home.path().join("large-skills-json.mjs");
+    let skill_path = serde_json::to_string(&fixture.skill.display().to_string()).unwrap();
+    std::fs::write(
+        &writer,
+        format!(
+            "const item = {{ name: 'demo', path: {skill_path}, scope: 'global', agents: [], padding: 'x'.repeat(100_000) }};\nconsole.log(JSON.stringify([item], null, 2));\nprocess.exit(0);\n"
+        ),
+    )
+    .unwrap();
+    let executable = fixture.bin.join("npx");
+    std::fs::write(
+        &executable,
+        format!(
+            r#"#!/bin/sh
+test "$DISABLE_TELEMETRY" = 1 || exit 70
+case "$*" in
+  "--version") echo '11.17.0' ;;
+  "--yes skills@^1.5.18 --version") echo '1.5.18' ;;
+  "--yes skills@^1.5.18 list --json") printf '[]\n' ;;
+  "--yes skills@^1.5.18 list --global --json") "{}" "{}" ;;
+  "--yes skills@^1.5.18 update demo --global --yes") printf 'after\n' > "$HOME/.agents/skills/demo/SKILL.md" ;;
+  *) exit 64 ;;
+esac
+"#,
+            node,
+            writer.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let (status, value) = check(&fixture);
+    assert!(status.success(), "{value}");
+    assert_eq!(value["data"]["inventories"][0]["id"], "skill:global:demo");
+}
+
+#[test]
+fn human_check_reports_agent_skills_progress() {
+    let fixture = Fixture::new("github", "1.5.18");
+    let output = fixture.beacon().arg("check").output().unwrap();
+
+    assert!(output.status.success());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("Checking Agent Skills"),
+        "missing Skills progress feedback: {stderr}"
+    );
+}
+
+#[test]
+fn verbose_check_reports_agent_skills_progress() {
+    let fixture = Fixture::new("github", "1.5.18");
+    let output = fixture
+        .beacon()
+        .args(["check", "--verbose"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("Checking Agent Skills"),
+        "missing verbose Skills progress feedback: {stderr}"
+    );
+}
+
+#[test]
+fn json_verbose_check_keeps_stderr_silent() {
+    let fixture = Fixture::new("github", "1.5.18");
+    let output = fixture
+        .beacon()
+        .args(["check", "--json", "--verbose"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap();
+    assert!(
+        output.stderr.is_empty(),
+        "JSON check wrote to stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]
@@ -250,6 +370,7 @@ test "$DISABLE_TELEMETRY" = 1 || exit 70
 case "$*" in
   "--version") echo '11.17.0' ;;
   "--yes skills@^1.5.18 --version") echo '1.5.18' ;;
+  "--yes skills@^1.5.18 list --json") printf '[]\n' ;;
   "--yes skills@^1.5.18 list --global --json") printf '[{{"name":"demo","path":"{}","scope":"global","agents":["codex"]}}]\n' ;;
   "--yes skills@^1.5.18 update demo --global --yes")
     if [ "$HOME" = "{}" ]; then
