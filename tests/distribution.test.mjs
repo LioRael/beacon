@@ -11,10 +11,10 @@ import { stageNpmPackage } from "../scripts/stage-npm-package.mjs";
 import { verifyReleaseVersion } from "../scripts/verify-release-version.mjs";
 
 test("renders a versioned Apple Silicon formula", () => {
-  const formula = renderFormula({ version: "0.4.0", sha256: "a".repeat(64) });
+  const formula = renderFormula({ version: "0.4.1", sha256: "a".repeat(64) });
 
   assert.match(formula, /class Beacon < Formula/);
-  assert.match(formula, /releases\/download\/v0\.4\.0\/beacon-v0\.4\.0-aarch64-apple-darwin\.tar\.gz/);
+  assert.match(formula, /releases\/download\/v0\.4\.1\/beacon-v0\.4\.1-aarch64-apple-darwin\.tar\.gz/);
   assert.match(formula, new RegExp(`sha256 "${"a".repeat(64)}"`));
   assert.match(formula, /depends_on macos: :sequoia/);
   assert.match(formula, /depends_on arch: :arm64/);
@@ -23,8 +23,8 @@ test("renders a versioned Apple Silicon formula", () => {
 });
 
 test("rejects unsafe formula inputs", () => {
-  assert.throws(() => renderFormula({ version: "v0.4.0", sha256: "a".repeat(64) }), /version/);
-  assert.throws(() => renderFormula({ version: "0.4.0", sha256: "nope" }), /SHA-256/);
+  assert.throws(() => renderFormula({ version: "v0.4.1", sha256: "a".repeat(64) }), /version/);
+  assert.throws(() => renderFormula({ version: "0.4.1", sha256: "nope" }), /SHA-256/);
 });
 
 test("release automation keeps optional publishers separate from the release", () => {
@@ -50,10 +50,10 @@ test("Rust and npm package versions stay synchronized", () => {
 
 test("release tags must match Rust and npm package versions", () => {
   assert.doesNotThrow(() =>
-    verifyReleaseVersion({ tag: "v0.4.0", cargoVersion: "0.4.0", npmVersion: "0.4.0" }),
+    verifyReleaseVersion({ tag: "v0.4.1", cargoVersion: "0.4.1", npmVersion: "0.4.1" }),
   );
   assert.throws(
-    () => verifyReleaseVersion({ tag: "v0.5.0", cargoVersion: "0.4.0", npmVersion: "0.4.0" }),
+    () => verifyReleaseVersion({ tag: "v0.5.0", cargoVersion: "0.4.1", npmVersion: "0.4.1" }),
     /does not match/,
   );
 });
@@ -67,7 +67,7 @@ test("stages a minimal npm tarball with the native binary", () => {
   stageNpmPackage({
     binary,
     output,
-    version: "0.4.0",
+    version: "0.4.1",
     repositoryRoot: fileURLToPath(new URL("..", import.meta.url)),
   });
   const metadata = JSON.parse(fs.readFileSync(path.join(output, "package.json"), "utf8"));
@@ -79,7 +79,7 @@ test("stages a minimal npm tarball with the native binary", () => {
   )[0];
   const files = packed.files.map((file) => file.path);
 
-  assert.equal(metadata.version, "0.4.0");
+  assert.equal(metadata.version, "0.4.1");
   assert.equal(fs.statSync(path.join(output, "vendor", "beacon")).mode & 0o777, 0o755);
   assert.ok(files.includes("bin/beacon.mjs"));
   assert.ok(files.includes("vendor/beacon"));
@@ -103,16 +103,16 @@ test("CI runs distribution, skill, and Formula validation", () => {
 
   assert.match(workflow, /node --test packages\/npm\/test\/\*\.test\.mjs tests\/\*\.test\.mjs/);
   assert.match(workflow, /render-homebrew-formula\.mjs/);
-  assert.match(workflow, /0\.4\.0/);
+  assert.match(workflow, /0\.4\.1/);
   assert.match(workflow, /ruby -c/);
-  assert.match(workflow, /verify-release-version\.mjs v0\.4\.0/);
+  assert.match(workflow, /verify-release-version\.mjs v0\.4\.1/);
 });
 
-test("README documents the inventory model and release metadata at 0.4.0", () => {
+test("README documents the inventory model and release metadata at 0.4.1", () => {
   const readme = fs.readFileSync(new URL("../README.md", import.meta.url), "utf8");
 
   assert.match(readme, /# Beacon 0\.4/);
-  assert.match(readme, /beacon-v0\.4\.0-aarch64-apple-darwin/);
+  assert.match(readme, /beacon-v0\.4\.1-aarch64-apple-darwin/);
   assert.match(readme, /schema_version: 2/);
   assert.match(readme, /docs\/domain-glossary\.md/);
   assert.match(readme, /docs\/adr\/0001-two-layer-provider-model\.md/);
