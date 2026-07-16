@@ -14,20 +14,21 @@ fn parses_versions_from_supported_tool_outputs() {
 }
 
 #[test]
-fn default_config_is_uninitialized_v3_until_the_cli_discovers_the_environment() {
+fn default_config_is_uninitialized_v4_until_the_cli_discovers_the_environment() {
     let config = Config::default();
-    assert_eq!(config.schema_version, 3);
+    assert_eq!(config.schema_version, 4);
     assert!(config.enabled_tools.is_empty());
     assert!(config.disabled_tools.is_empty());
     assert!(config.enabled_inventories.is_empty());
     assert!(config.disabled_inventories.is_empty());
     assert_eq!(config.tool_catalog_version, 0);
+    assert_eq!(config.inventory_catalog_version, 0);
     assert_eq!(config.history_limit, 500);
     assert_eq!(config.command_timeout_seconds, 120);
 }
 
 #[test]
-fn ensure_writes_fresh_uninitialized_v3_config_when_missing() {
+fn ensure_writes_fresh_uninitialized_v4_config_when_missing() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("config.toml");
 
@@ -35,24 +36,25 @@ fn ensure_writes_fresh_uninitialized_v3_config_when_missing() {
     let written = std::fs::read_to_string(&path).unwrap();
 
     assert_eq!(returned, path);
-    assert_eq!(config.schema_version, 3);
+    assert_eq!(config.schema_version, 4);
     assert!(config.enabled_tools.is_empty());
     assert!(config.enabled_inventories.is_empty());
-    assert!(written.contains("schema_version = 3"));
+    assert!(written.contains("schema_version = 4"));
     assert!(written.contains("enabled_tools"));
     assert!(written.contains("enabled_inventories"));
     assert!(written.contains("tool_catalog_version = 0"));
+    assert!(written.contains("inventory_catalog_version = 0"));
     assert!(!path.with_file_name("config.toml.tmp").exists());
     assert!(!directory.path().join("config.toml.v1.bak").exists());
 }
 
 #[test]
-fn sqlite_fresh_database_is_user_version_2_without_manager_column() {
+fn sqlite_fresh_database_is_user_version_3_with_scoped_history() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("beacon.db");
     let store = Store::open(&path).unwrap();
 
-    assert_eq!(store.schema_version().unwrap(), 2);
+    assert_eq!(store.schema_version().unwrap(), 3);
     store
         .record(
             "upgrade",
@@ -68,13 +70,63 @@ fn sqlite_fresh_database_is_user_version_2_without_manager_column() {
     let history = store.history(1).unwrap();
     assert_eq!(history[0].installation_source, "mise");
     assert_eq!(history[0].update_manager, "npm");
+    assert_eq!(history[0].resource_scope, "system");
+    assert!(history[0].scope_locator.is_none());
     assert!(!history_json_has_manager_field(&history[0]));
 
     let columns = table_columns(&path, "history");
     assert!(columns.contains(&"installation_source".into()));
     assert!(columns.contains(&"update_manager".into()));
+    assert!(columns.contains(&"resource_scope".into()));
+    assert!(columns.contains(&"scope_locator".into()));
     assert!(!columns.contains(&"manager".into()));
     assert!(table_columns(&path, "snapshots").contains(&"payload_schema_version".into()));
+    assert!(table_columns(&path, "skill_baselines").contains(&"receipt_fingerprint".into()));
+}
+
+#[test]
+fn sqlite_v3_persists_and_replaces_global_skill_baselines() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::open(&directory.path().join("beacon.db")).unwrap();
+    assert!(
+        store
+            .skill_baseline("global", "", "demo")
+            .unwrap()
+            .is_none()
+    );
+    store
+        .upsert_skill_baseline("global", "", "demo", "receipt-1", "sha256:one")
+        .unwrap();
+    let baseline = store.skill_baseline("global", "", "demo").unwrap().unwrap();
+    assert_eq!(baseline.receipt_fingerprint, "receipt-1");
+    assert_eq!(baseline.content_revision, "sha256:one");
+    store
+        .upsert_skill_baseline("global", "", "demo", "receipt-2", "sha256:two")
+        .unwrap();
+    let baseline = store.skill_baseline("global", "", "demo").unwrap().unwrap();
+    assert_eq!(baseline.receipt_fingerprint, "receipt-2");
+    assert_eq!(baseline.content_revision, "sha256:two");
+}
+
+#[test]
+fn config_v3_migration_adds_an_independent_inventory_catalog_and_backup() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("config.toml");
+    let original = "# keep\nschema_version = 3\nenabled_tools = [\"node\"]\ndisabled_tools = []\nenabled_inventories = [\"homebrew\"]\ndisabled_inventories = []\ntool_catalog_version = 1\nhistory_limit = 20\ncommand_timeout_seconds = 5\ncustom_key = \"keep\"\n";
+    std::fs::write(&path, original).unwrap();
+
+    let (config, _) = beacon::config::ensure_at(&path).unwrap();
+    let migrated = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(config.schema_version, 4);
+    assert_eq!(config.inventory_catalog_version, 0);
+    assert_eq!(config.enabled_inventories, ["homebrew"]);
+    assert!(migrated.contains("# keep"));
+    assert!(migrated.contains("custom_key = \"keep\""));
+    assert!(migrated.contains("inventory_catalog_version = 0"));
+    assert_eq!(
+        std::fs::read_to_string(directory.path().join("config.toml.v3.bak")).unwrap(),
+        original
+    );
 }
 
 #[test]
@@ -125,7 +177,7 @@ fn config_v1_migration_preserves_comments_and_unknown_keys() {
     let migrated = std::fs::read_to_string(&path).unwrap();
     let backup = std::fs::read_to_string(directory.path().join("config.toml.v1.bak")).unwrap();
 
-    assert_eq!(config.schema_version, 3);
+    assert_eq!(config.schema_version, 4);
     assert_eq!(config.enabled_tools, ["node"]);
     assert_eq!(config.enabled_inventories, ["homebrew"]);
     assert!(migrated.contains("# keep this comment"));
@@ -155,7 +207,7 @@ fn config_v1_migration_moves_homebrew_and_keeps_valid_settings() {
     let migrated = std::fs::read_to_string(&path).unwrap();
     let backup = std::fs::read_to_string(directory.path().join("config.toml.v1.bak")).unwrap();
 
-    assert_eq!(config.schema_version, 3);
+    assert_eq!(config.schema_version, 4);
     assert_eq!(config.enabled_tools, ["node", "rust"]);
     assert_eq!(config.enabled_inventories, ["homebrew"]);
     assert_eq!(config.history_limit, 42);
@@ -197,14 +249,14 @@ fn config_v1_migration_without_enabled_tools_uses_fresh_defaults() {
     let migrated = std::fs::read_to_string(&path).unwrap();
     let backup = std::fs::read_to_string(directory.path().join("config.toml.v1.bak")).unwrap();
 
-    assert_eq!(config.schema_version, 3);
+    assert_eq!(config.schema_version, 4);
     assert_eq!(
         config.enabled_tools,
         ["rust", "node", "npm", "pnpm", "go", "bun", "deno", "uv"]
     );
     assert_eq!(config.enabled_inventories, ["homebrew"]);
     assert_eq!(config.history_limit, 10);
-    assert!(migrated.contains("schema_version = 3"));
+    assert!(migrated.contains("schema_version = 4"));
     assert!(migrated.contains("enabled_tools"));
     assert!(migrated.contains("enabled_inventories = [\"homebrew\"]"));
     assert!(migrated.contains("\"bun\""));
@@ -252,7 +304,7 @@ fn sqlite_v1_migration_backfills_source_unknown_updater_and_preserves_snapshots(
     let history = store.history(10).unwrap();
     let snapshots = store.snapshots(10).unwrap();
 
-    assert_eq!(store.schema_version().unwrap(), 2);
+    assert_eq!(store.schema_version().unwrap(), 3);
     assert_eq!(history.len(), 3);
     assert_eq!(history[0].summary, "legacy-ok");
     assert_eq!(history[0].installation_source, "mise");
@@ -334,7 +386,7 @@ fn sqlite_v1_migration_allows_new_records_and_is_idempotent_on_reopen() {
 
     drop(store);
     let reopened = Store::open(&path).unwrap();
-    assert_eq!(reopened.schema_version().unwrap(), 2);
+    assert_eq!(reopened.schema_version().unwrap(), 3);
     let history_again = reopened.history(10).unwrap();
     assert_eq!(history_again.len(), 3);
     assert_eq!(history_again[0].summary, history[0].summary);
@@ -415,7 +467,7 @@ fn sqlite_heals_broken_v2_stamp_that_still_has_manager_column() {
     drop(connection);
 
     let store = Store::open(&path).unwrap();
-    assert_eq!(store.schema_version().unwrap(), 2);
+    assert_eq!(store.schema_version().unwrap(), 3);
     let history = store.history(1).unwrap();
     assert_eq!(history[0].installation_source, "mise");
     assert_eq!(history[0].update_manager, "unknown");
