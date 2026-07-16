@@ -268,7 +268,7 @@ fn fresh_config_enables_only_tools_available_on_the_current_path() {
     let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(value["schema_version"], 2);
     assert_eq!(value["status"], "ok");
-    assert_eq!(value["data"]["schema_version"], 3);
+    assert_eq!(value["data"]["schema_version"], 4);
     assert_eq!(
         value["data"]["enabled_tools"],
         serde_json::json!(["node", "bun"])
@@ -276,6 +276,7 @@ fn fresh_config_enables_only_tools_available_on_the_current_path() {
     assert_eq!(value["data"]["disabled_tools"], serde_json::json!([]));
     assert_eq!(value["data"]["enabled_inventories"], serde_json::json!([]));
     assert_eq!(value["data"]["tool_catalog_version"], 1);
+    assert_eq!(value["data"]["inventory_catalog_version"], 1);
     assert!(value["errors"].as_array().unwrap().is_empty());
 }
 
@@ -348,7 +349,7 @@ fn cli_v2_migration_prunes_missing_tools_and_adds_installed_supported_tools() {
         String::from_utf8_lossy(&output.stderr)
     );
     let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(value["data"]["schema_version"], 3);
+    assert_eq!(value["data"]["schema_version"], 4);
     assert_eq!(
         value["data"]["enabled_tools"],
         serde_json::json!(["node", "bun", "uv"])
@@ -591,7 +592,7 @@ fn cli_migrates_v1_config_with_backup_and_stays_idempotent() {
         String::from_utf8_lossy(&first.stderr)
     );
     let value: serde_json::Value = serde_json::from_slice(&first.stdout).unwrap();
-    assert_eq!(value["data"]["schema_version"], 3);
+    assert_eq!(value["data"]["schema_version"], 4);
     assert_eq!(
         value["data"]["enabled_tools"],
         serde_json::json!(["rust", "node"])
@@ -608,7 +609,7 @@ fn cli_migrates_v1_config_with_backup_and_stays_idempotent() {
     assert!(migrated.contains("# preserve"));
     assert!(migrated.contains("custom_key = \"keep\""));
     assert!(migrated.contains("history_limit = 42"));
-    assert!(migrated.contains("schema_version = 3"));
+    assert!(migrated.contains("schema_version = 4"));
     assert!(migrated.contains("enabled_inventories = [\"homebrew\"]"));
     assert!(!migrated.contains("preferred_install_manager"));
     assert!(
@@ -638,7 +639,7 @@ fn cli_rejects_future_config_schema_without_rewrite() {
     let home = tempfile::tempdir().unwrap();
     let path = config_path_for(home.path());
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-    let original = "schema_version = 4\nenabled_tools = [\"node\"]\n";
+    let original = "schema_version = 5\nenabled_tools = [\"node\"]\n";
     std::fs::write(&path, original).unwrap();
 
     let json = Command::new(env!("CARGO_BIN_EXE_beacon"))
@@ -656,7 +657,7 @@ fn cli_rejects_future_config_schema_without_rewrite() {
         value["errors"][0]["message"]
             .as_str()
             .unwrap()
-            .contains("unsupported Beacon config schema version 4")
+            .contains("unsupported Beacon config schema version 5")
     );
 
     let human = Command::new(env!("CARGO_BIN_EXE_beacon"))
@@ -667,7 +668,7 @@ fn cli_rejects_future_config_schema_without_rewrite() {
     assert_eq!(human.status.code(), Some(1));
     let stderr = String::from_utf8_lossy(&human.stderr);
     assert!(
-        stderr.contains("unsupported Beacon config schema version 4"),
+        stderr.contains("unsupported Beacon config schema version 5"),
         "stderr={stderr}"
     );
 

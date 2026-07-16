@@ -1,7 +1,7 @@
 use crate::{
     AlternativeInstallation, CheckData, Diagnostics, InstallationReport, InventoryReport,
-    ToolReport, ToolStatus, UpdateReport, command::CommandSpec, config::Config, ui::Ui,
-    versions::version_number,
+    InventoryRuntime, ResourceScope, ToolReport, ToolStatus, UpdateReport, command::CommandSpec,
+    config::Config, ui::Ui, versions::version_number,
 };
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
@@ -1833,6 +1833,12 @@ async fn homebrew_inventory(
             latest: None,
             action: None,
             detail: Some("Homebrew refresh failed".into()),
+            scope: ResourceScope::System,
+            installation_source: Some("homebrew".into()),
+            source_locator: Some("homebrew".into()),
+            update_manager: Some("homebrew".into()),
+            changes: Vec::new(),
+            runtime: InventoryRuntime::default(),
         }];
     }
     let output = match context
@@ -1853,6 +1859,12 @@ async fn homebrew_inventory(
                 latest: None,
                 action: None,
                 detail: Some(error.to_string()),
+                scope: ResourceScope::System,
+                installation_source: Some("homebrew".into()),
+                source_locator: Some("homebrew".into()),
+                update_manager: Some("homebrew".into()),
+                changes: Vec::new(),
+                runtime: InventoryRuntime::default(),
             }];
         }
     };
@@ -1868,6 +1880,12 @@ async fn homebrew_inventory(
                 latest: None,
                 action: None,
                 detail: Some(error.to_string()),
+                scope: ResourceScope::System,
+                installation_source: Some("homebrew".into()),
+                source_locator: Some("homebrew".into()),
+                update_manager: Some("homebrew".into()),
+                changes: Vec::new(),
+                runtime: InventoryRuntime::default(),
             }];
         }
     };
@@ -1900,6 +1918,12 @@ async fn homebrew_inventory(
             latest,
             action,
             detail: None,
+            scope: ResourceScope::System,
+            installation_source: Some("homebrew".into()),
+            source_locator: Some("homebrew".into()),
+            update_manager: Some("homebrew".into()),
+            changes: Vec::new(),
+            runtime: InventoryRuntime::default(),
         });
     }
     reports.sort_by(|left, right| left.id.cmp(&right.id));
@@ -2019,31 +2043,60 @@ pub async fn probe_tools_for(config: &Config, ui: &Ui, ids: &[String]) -> Vec<To
 }
 
 pub async fn available_inventories(config: &Config, ui: &Ui) -> Vec<String> {
+    available_inventories_for(config, ui, &["homebrew".to_string(), "skills".to_string()]).await
+}
+
+pub async fn available_inventories_for(config: &Config, ui: &Ui, ids: &[String]) -> Vec<String> {
     let executor = SystemCommandExecutor {
         verbose: ui.mode() == crate::ui::FeedbackMode::Verbose,
     };
     let context = ProviderContext::new(&executor, ui, config.command_timeout_seconds);
-    let found = context
-        .execute_silent(&CommandSpec::new("/usr/bin/which", ["brew"]))
-        .await
-        .is_ok()
-        && context
-            .execute_silent(&CommandSpec::new("brew", ["--version"]))
+    let mut available = Vec::new();
+    if ids.iter().any(|id| id == "homebrew") {
+        let found = context
+            .execute_silent(&CommandSpec::new("/usr/bin/which", ["brew"]))
             .await
-            .is_ok();
-    if found {
-        vec!["homebrew".into()]
-    } else {
-        Vec::new()
+            .is_ok()
+            && context
+                .execute_silent(&CommandSpec::new("brew", ["--version"]))
+                .await
+                .is_ok();
+        if found {
+            available.push("homebrew".into());
+        }
     }
+    if ids.iter().any(|id| id == "skills")
+        && crate::agent_skills::probe(config.command_timeout_seconds)
+            .await
+            .is_ok()
+    {
+        available.push("skills".into());
+    }
+    available
 }
 
 pub async fn check_all(config: &Config, refresh: bool, ui: &Ui) -> Result<CheckData> {
+    check_all_with_store(config, refresh, ui, None).await
+}
+
+pub async fn check_all_with_store(
+    config: &Config,
+    refresh: bool,
+    ui: &Ui,
+    store: Option<&crate::store::Store>,
+) -> Result<CheckData> {
     let executor = SystemCommandExecutor {
         verbose: ui.mode() == crate::ui::FeedbackMode::Verbose,
     };
     let context = ProviderContext::new(&executor, ui, config.command_timeout_seconds);
-    check_all_with_context(config, refresh, &context).await
+    let mut data = check_all_with_context(config, refresh, &context).await?;
+    if config.enabled_inventories.iter().any(|id| id == "skills") {
+        data.inventories
+            .extend(crate::agent_skills::inventory(config.command_timeout_seconds, store).await);
+        data.inventories
+            .sort_by(|left, right| left.id.cmp(&right.id));
+    }
+    Ok(data)
 }
 
 pub async fn verify_with_context(

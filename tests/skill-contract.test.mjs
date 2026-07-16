@@ -22,15 +22,27 @@ test("skill keeps read-only checks automatic and upgrades confirmed", () => {
   assert.match(skill, /beacon history.*--json/);
   assert.match(skill, /explicit confirmation/i);
   assert.match(skill, /beacon upgrade <targets> --yes/);
-  assert.match(skill, /Report missing tools for diagnosis only/i);
+  assert.match(skill, /Report missing resources for diagnosis only/i);
   assert.match(skill, /schema_version: 2/);
   assert.match(skill, /data\.tools.*data\.inventories/i);
   assert.match(skill, /installation\.source.*update\.manager/i);
 });
 
 test("skill excludes missing and unmanaged from upgrade targets", () => {
-  assert.match(skill, /Never pass missing or unmanaged tools to `upgrade`/i);
+  assert.match(skill, /Never pass missing or unmanaged resources to `upgrade`/i);
   assert.match(skill, /status is `outdated` and whose `action` is present/);
+});
+
+test("skill delegates Agent Skill topology through a compatible package runner", () => {
+  assert.match(skill, /skills.*>=1\.5\.18,<2\.0\.0/is);
+  assert.match(skill, /npx --yes skills@\^1\.5\.18/i);
+  assert.match(skill, /bunx skills@\^1\.5\.18/i);
+  assert.match(skill, /does not install a global `skills` executable/i);
+  assert.match(skill, /no separate `beacon skills` command/i);
+  assert.match(skill, /skill:global:<name>/);
+  assert.match(skill, /skill:project:<name>/);
+  assert.match(skill, /Skills CLI owns that topology/i);
+  assert.match(skill, /added\/modified\/removed `changes` manifest/i);
 });
 
 test("skill understands exact, floating, and rolling verification modes", () => {

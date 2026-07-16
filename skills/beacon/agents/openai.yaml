@@ -1,6 +1,6 @@
 interface:
   display_name: "Beacon"
-  short_description: "Check and safely update development toolchains"
-  default_prompt: "Use $beacon to check my development environment and prepare safe updates."
+  short_description: "Safely update toolchains and Agent Skills"
+  default_prompt: "Use $beacon to check my development environment and Agent Skills, then prepare safe updates."
 policy:
   allow_implicit_invocation: true

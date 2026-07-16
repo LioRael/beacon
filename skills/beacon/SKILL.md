@@ -1,6 +1,6 @@
 ---
 name: beacon
-description: Manage a macOS development toolchain with the Beacon CLI. Use when the user mentions Beacon or asks to check, diagnose, or safely upgrade Homebrew, Rust, Node, npm, pnpm, Go, Bun, Deno, or uv installations. Do not use for project dependency upgrades, ordinary macOS application updates, or unrelated software management.
+description: Manage a macOS development toolchain and third-party Agent Skills with the Beacon CLI. Use when the user mentions Beacon or asks to check, diagnose, or safely upgrade Homebrew, Agent Skills, Rust, Node, npm, pnpm, Go, Bun, Deno, or uv installations. Do not use for project dependency upgrades, ordinary macOS application updates, or unrelated software management.
 ---
 
 # Beacon
@@ -35,7 +35,7 @@ beacon config inventories --json
 
 Always prefer `--json` machine output. Require `schema_version: 2` and parse the JSON envelope (`status`, `data`, `errors`). Never scrape colored or human terminal tables for decisions. Traverse `data.tools` and `data.inventories` separately. Treat `installation` and `update` as explicitly nullable.
 
-Summarize current, outdated, missing, unmanaged, and failed tools. Preserve `installation.source` separately from `update.manager` in every summary and confirmation; never collapse them into a single "manager". `check` reports configured tools, not every supported tool: a missing report means the user explicitly chose to monitor that tool. Report missing tools for diagnosis only. Never pass missing or unmanaged tools to `upgrade`.
+Summarize current, outdated, missing, unmanaged, and failed resources. Preserve installation source separately from update manager in every summary and confirmation; never collapse them into a single "manager". For tools, read `installation.source` and `update.manager`. For inventories, read `installation_source` and `update_manager`, plus `scope` and redacted `source_locator` when present. `check` reports configured resources, not every supported resource: a missing report means the user explicitly chose to monitor it. Report missing resources for diagnosis only. Never pass missing or unmanaged resources to `upgrade`.
 
 When the user asks to change the monitored scope, use the domain commands rather than editing TOML or using list-valued `config set` calls:
 
@@ -49,7 +49,9 @@ beacon config inventories disable <inventories> --json
 beacon config inventories reset --json
 ```
 
-Treat these as state-changing commands and get confirmation when the user has not already requested the change. `sync` adds tools that are executable on the current `PATH` and pass a version probe, but never re-enables an explicitly disabled tool. Configuration schema v3 is distinct from the schema v2 JSON envelope.
+Treat these as state-changing commands and get confirmation when the user has not already requested the change. `sync` adds tools that are executable on the current `PATH` and pass a version probe, but never re-enables an explicitly disabled tool. Configuration schema v4 is distinct from the schema v2 JSON envelope.
+
+The `skills` inventory uses a package runner rather than a globally installed CLI. Beacon prefers `npx --yes skills@^1.5.18` and falls back to `bunx skills@^1.5.18`; the resolved CLI must satisfy `>=1.5.18,<2.0.0`. Beacon does not install a global `skills` executable, and there is no separate `beacon skills` command. Agent Skill items use `skill:global:<name>` and `skill:project:<name>` IDs. Treat a bare Skill name as valid only when it is unique in the current result. Do not infer or manage agent-specific copies or links; the Skills CLI owns that topology.
 
 Interpret envelope outcomes:
 
@@ -68,6 +70,7 @@ Show the user:
 - Each exact target.
 - Current and latest versions.
 - Detected installation source and update manager, kept separate.
+- For an Agent Skill, its global/project scope and every path in its added/modified/removed `changes` manifest. Do not request or display file contents unless the user separately asks to inspect the source.
 - The exact action Beacon reports.
 - Whether the action has an `exact`, `floating`, or `rolling` target mode:
   - `exact`: post-upgrade version must equal the confirmed expected version.
@@ -87,7 +90,7 @@ Do not add targets, use an untargeted `brew upgrade`, install missing tools thro
 - If some targets succeeded before the failure, expect `status: "partial"` and exit 2.
 - If no target succeeded, expect `status: "error"` and exit 1.
 
-In both cases report recovery guidance from the structured `errors` field and wait for direction. Do not scrape human terminal output or auto-retry.
+In both cases report recovery guidance from the structured `errors` field and wait for direction. A failed Agent Skill update may retain a home-redacted recovery path containing only the canonical Skill and applicable receipt; do not treat it as an automatic agent-topology rollback. Do not scrape human terminal output or auto-retry.
 
 ## Stay within scope
 

@@ -155,6 +155,9 @@ struct PlannedUpgrade {
     updater: String,
     action: providers::UpgradeAction,
     tool: Option<ToolReport>,
+    inventory: Option<InventoryReport>,
+    resource_scope: String,
+    scope_locator: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -166,6 +169,8 @@ struct UpgradeResult {
     update_manager: String,
     status: String,
     action: providers::UpgradeAction,
+    resource_scope: String,
+    scope_locator: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -334,19 +339,41 @@ fn print_reports(data: &CheckData, ui: &Ui) {
         }
     }
     if !data.inventories.is_empty() {
-        println!("\nHOMEBREW INVENTORY");
+        println!("\nINVENTORY");
         for item in &data.inventories {
+            let current = item
+                .current
+                .as_ref()
+                .map(|version| abbreviated_revision(version.display()))
+                .unwrap_or_else(|| "—".into());
+            let latest = item
+                .latest
+                .as_ref()
+                .map(|version| abbreviated_revision(version.display()))
+                .unwrap_or_else(|| "—".into());
             println!(
-                "{:<32} {:<11} {}",
+                "{:<32} {:<11} {:<22} → {:<22} {}",
                 item.id,
                 format!("{:?}", item.status).to_lowercase(),
-                item.latest
-                    .as_ref()
-                    .map(|version| version.display())
-                    .unwrap_or("—")
+                current,
+                latest,
+                item.update_manager.as_deref().unwrap_or("unmanaged")
             );
+            if let Some(detail) = &item.detail {
+                println!("  {detail}");
+            }
+            for change in &item.changes {
+                println!("  {:?}: {}", change.kind, change.path);
+            }
         }
     }
+}
+
+fn abbreviated_revision(value: &str) -> String {
+    value
+        .strip_prefix("sha256:")
+        .map(|digest| format!("sha256:{}", digest.chars().take(12).collect::<String>()))
+        .unwrap_or_else(|| value.to_string())
 }
 
 fn tool_plan(report: &ToolReport) -> Option<PlannedUpgrade> {
@@ -364,6 +391,9 @@ fn tool_plan(report: &ToolReport) -> Option<PlannedUpgrade> {
         updater: update.manager.to_string(),
         action: update.action.clone(),
         tool: Some(report.clone()),
+        inventory: None,
+        resource_scope: "system".into(),
+        scope_locator: None,
     })
 }
 
@@ -376,10 +406,22 @@ fn inventory_plan(report: &InventoryReport) -> Option<PlannedUpgrade> {
             .current
             .as_ref()
             .map(|version| version.display().to_string()),
-        source: "homebrew".into(),
-        updater: "homebrew".into(),
+        source: report
+            .installation_source
+            .clone()
+            .unwrap_or_else(|| "unknown".into()),
+        updater: report
+            .update_manager
+            .clone()
+            .unwrap_or_else(|| action.manager.to_string()),
         action: action.clone(),
         tool: None,
+        inventory: Some(report.clone()),
+        resource_scope: report.scope.as_str().into(),
+        scope_locator: report.runtime.project_root.as_ref().map(|root| {
+            let home = std::env::var("HOME").ok();
+            redact(&root.display().to_string(), home.as_deref())
+        }),
     })
 }
 
@@ -392,7 +434,19 @@ fn all_plans(data: &CheckData) -> Vec<PlannedUpgrade> {
 }
 
 fn matches_target(plan: &PlannedUpgrade, target: &str, data: &CheckData) -> Result<bool> {
-    if plan.id == target || plan.name == target {
+    if plan.id == target {
+        return Ok(true);
+    }
+    if plan.name == target {
+        let count = data.tools.iter().filter(|item| item.name == target).count()
+            + data
+                .inventories
+                .iter()
+                .filter(|item| item.name == target)
+                .count();
+        if count > 1 {
+            bail!("target `{target}` is ambiguous; use a fully scoped inventory id");
+        }
         return Ok(true);
     }
     if let Some(name) = target
@@ -647,7 +701,33 @@ fn assert_preflight(planned: &PlannedUpgrade, current: &ToolReport) -> Result<()
     Ok(())
 }
 
+fn assert_inventory_preflight(planned: &PlannedUpgrade, current: &InventoryReport) -> Result<()> {
+    let original = planned
+        .inventory
+        .as_ref()
+        .context("inventory preflight has no original report")?;
+    if current.current.as_ref().map(|version| version.display()) != planned.current.as_deref()
+        || current.action.as_ref().map(|action| &action.manager) != Some(&planned.action.manager)
+        || current.scope != original.scope
+        || current.installation_source != original.installation_source
+        || current.source_locator != original.source_locator
+        || current.runtime.canonical_path != original.runtime.canonical_path
+        || current.runtime.manager_path != original.runtime.manager_path
+        || current.runtime.manager_version != original.runtime.manager_version
+    {
+        bail!("inventory source, scope, updater, path, or version drifted after confirmation");
+    }
+    Ok(())
+}
+
 async fn verify_inventory(plan: &PlannedUpgrade, ui: &Ui, timeout_seconds: u64) -> Result<String> {
+    if let Some(report) = plan
+        .inventory
+        .as_ref()
+        .filter(|report| report.kind == "agent-skill")
+    {
+        return beacon::agent_skills::verify(report, timeout_seconds).await;
+    }
     let output = ui
         .run_command(
             &format!("Verifying {}", plan.name),
@@ -717,27 +797,43 @@ async fn run(cli: Cli) -> Result<i32> {
     let config_was_missing = !config::path()?.exists();
     let human_output = !cli.command.json();
     let (mut config, config_path) = config::ensure()?;
-    if config.tool_catalog_version < config::TOOL_CATALOG_VERSION {
+    if config.tool_catalog_version < config::TOOL_CATALOG_VERSION
+        || config.inventory_catalog_version < config::INVENTORY_CATALOG_VERSION
+    {
         let ui = Ui::new(true, cli.verbose, cli.no_color);
-        let pending_tools = providers::tool_registry()
-            .iter()
-            .map(|adapter| adapter.id().to_string())
-            .filter(|id| {
-                config.tool_catalog_version == 0
-                    || config::tool_catalog_entry_version(id) > config.tool_catalog_version
-            })
-            .collect::<Vec<_>>();
-        let probes = providers::probe_tools_for(&config, &ui, &pending_tools).await;
-        let available_tools = probes
-            .iter()
-            .filter(|probe| probe.available)
-            .map(|probe| probe.id.clone())
-            .collect::<Vec<_>>();
-        let available_inventories = if config.tool_catalog_version == 0 {
-            providers::available_inventories(&config, &ui).await
+        let available_tools = if config.tool_catalog_version < config::TOOL_CATALOG_VERSION {
+            let pending_tools = providers::tool_registry()
+                .iter()
+                .map(|adapter| adapter.id().to_string())
+                .filter(|id| {
+                    config.tool_catalog_version == 0
+                        || config::tool_catalog_entry_version(id) > config.tool_catalog_version
+                })
+                .collect::<Vec<_>>();
+            providers::probe_tools_for(&config, &ui, &pending_tools)
+                .await
+                .into_iter()
+                .filter(|probe| probe.available)
+                .map(|probe| probe.id)
+                .collect::<Vec<_>>()
         } else {
             Vec::new()
         };
+        let available_inventories =
+            if config.inventory_catalog_version < config::INVENTORY_CATALOG_VERSION {
+                let pending_inventories = ["homebrew", "skills"]
+                    .into_iter()
+                    .filter(|id| {
+                        config.inventory_catalog_version == 0
+                            || config::inventory_catalog_entry_version(id)
+                                > config.inventory_catalog_version
+                    })
+                    .map(str::to_string)
+                    .collect::<Vec<_>>();
+                providers::available_inventories_for(&config, &ui, &pending_inventories).await
+            } else {
+                Vec::new()
+            };
         if config::initialize_catalog(&mut config, &available_tools, &available_inventories) {
             config::save_to(&config, &config_path)?;
             if config_was_missing && human_output {
@@ -750,10 +846,14 @@ async fn run(cli: Cli) -> Result<i32> {
     }
     let (db_path, log_path) = paths()?;
     let store = Store::open(&db_path)?;
+    let recovery_root = db_path
+        .parent()
+        .context("Beacon database path has no parent")?
+        .join("recovery/skills");
     match cli.command {
         Commands::Check(args) => {
             let ui = Ui::new(args.json, cli.verbose, cli.no_color);
-            let data = providers::check_all(&config, true, &ui).await?;
+            let data = providers::check_all_with_store(&config, true, &ui, Some(&store)).await?;
             let errors = report_errors(&data);
             let partial = !errors.is_empty();
             store.snapshot(&data)?;
@@ -789,13 +889,31 @@ async fn run(cli: Cli) -> Result<i32> {
         }
         Commands::Doctor(args) => {
             let ui = Ui::new(args.json, cli.verbose, cli.no_color);
-            let mut data = providers::check_all(&config, false, &ui).await?;
+            let mut data =
+                providers::check_all_with_store(&config, false, &ui, Some(&store)).await?;
             if !args.targets.is_empty() {
-                data.tools.retain(|report| {
-                    args.targets
+                let mut selected = Vec::new();
+                for target in &args.targets {
+                    let matching = data
+                        .tools
                         .iter()
-                        .any(|target| target == &report.id || target == &report.name)
-                });
+                        .map(|report| (&report.id, &report.name))
+                        .chain(
+                            data.inventories
+                                .iter()
+                                .map(|report| (&report.id, &report.name)),
+                        )
+                        .filter(|(id, name)| *id == target || *name == target)
+                        .map(|(id, _)| id.clone())
+                        .collect::<Vec<_>>();
+                    if matching.len() > 1 {
+                        bail!("target `{target}` is ambiguous; use a fully scoped id");
+                    }
+                    selected.extend(matching);
+                }
+                data.tools.retain(|report| selected.contains(&report.id));
+                data.inventories
+                    .retain(|report| selected.contains(&report.id));
             }
             let errors = report_errors(&data);
             let partial = !errors.is_empty();
@@ -811,7 +929,7 @@ async fn run(cli: Cli) -> Result<i32> {
                 } else {
                     "partial"
                 },
-                &format!("{} results", data.tools.len()),
+                &format!("{} results", data.tools.len() + data.inventories.len()),
             )?;
             if args.json {
                 if errors.is_empty() {
@@ -826,18 +944,36 @@ async fn run(cli: Cli) -> Result<i32> {
         }
         Commands::Upgrade(args) => {
             let ui = Ui::new(args.json, cli.verbose, cli.no_color);
-            let data = providers::check_all(&config, true, &ui).await?;
+            let data = providers::check_all_with_store(&config, true, &ui, Some(&store)).await?;
             let selected = select_targets(&data, &args, &ui)?;
             let home = std::env::var("HOME").ok();
             let mut batch = UpgradeBatch::default();
             for (index, plan) in selected.iter().enumerate() {
+                let change_summary = plan
+                    .inventory
+                    .as_ref()
+                    .filter(|report| !report.changes.is_empty())
+                    .map(|report| {
+                        format!(
+                            "; {} files: {}",
+                            report.changes.len(),
+                            report
+                                .changes
+                                .iter()
+                                .map(|change| change.path.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        )
+                    })
+                    .unwrap_or_default();
                 if !args.yes
                     && !Confirm::new()
                         .with_prompt(format!(
-                            "Run `{}` → {} ({})?",
+                            "Run `{}` → {} ({}){}?",
                             plan.action.command.display(),
                             plan.action.expected_version.display(),
-                            plan.action.target_mode
+                            plan.action.target_mode,
+                            change_summary
                         ))
                         .default(false)
                         .interact()?
@@ -845,7 +981,8 @@ async fn run(cli: Cli) -> Result<i32> {
                     continue;
                 }
                 let attempt: Result<(beacon::runner::CommandOutput, Option<String>)> = async {
-                    let fresh = providers::check_all(&config, true, &ui).await?;
+                    let fresh =
+                        providers::check_all_with_store(&config, true, &ui, Some(&store)).await?;
                     if plan.tool.is_some() {
                         let current = fresh
                             .tools
@@ -859,24 +996,37 @@ async fn run(cli: Cli) -> Result<i32> {
                             .iter()
                             .find(|report| report.id == plan.id)
                             .context("inventory target disappeared during preflight")?;
-                        if current.current.as_ref().map(|version| version.display())
-                            != plan.current.as_deref()
-                            || current.action.as_ref().map(|action| &action.manager)
-                                != Some(&plan.action.manager)
-                        {
-                            bail!(
-                                "inventory source, updater, or version drifted after confirmation"
-                            );
-                        }
+                        assert_inventory_preflight(plan, current)?;
                     }
+                    let recovery = plan
+                        .inventory
+                        .as_ref()
+                        .filter(|report| report.kind == "agent-skill")
+                        .map(|report| {
+                            beacon::agent_skills::prepare_recovery(report, &recovery_root)
+                        })
+                        .transpose()?;
+                    let recovery_hint = recovery.as_ref().map(|copy| {
+                        format!(
+                            " Recovery copy retained at {}.",
+                            redact(&copy.path().display().to_string(), home.as_deref())
+                        )
+                    });
                     let label =
                         format!("[{}/{}] Upgrading {}", index + 1, selected.len(), plan.name);
                     let output = ui
                         .run_command(&label, &plan.action.command, config.command_timeout_seconds)
-                        .await?;
+                        .await;
+                    let output = match (output, recovery_hint.as_deref()) {
+                        (Ok(output), _) => output,
+                        (Err(error), Some(hint)) => bail!("{error}.{hint}"),
+                        (Err(error), None) => return Err(error),
+                    };
                     let new_version = if let Some(report) = &plan.tool {
                         let new = providers::verify(report, &config, &ui).await?;
-                        let post = providers::check_all(&config, false, &ui).await?;
+                        let post =
+                            providers::check_all_with_store(&config, false, &ui, Some(&store))
+                                .await?;
                         let post_report = post
                             .tools
                             .iter()
@@ -900,8 +1050,17 @@ async fn run(cli: Cli) -> Result<i32> {
                         }
                         new
                     } else {
-                        Some(verify_inventory(plan, &ui, config.command_timeout_seconds).await?)
+                        let verified =
+                            verify_inventory(plan, &ui, config.command_timeout_seconds).await;
+                        Some(match (verified, recovery_hint.as_deref()) {
+                            (Ok(version), _) => version,
+                            (Err(error), Some(hint)) => bail!("{error}.{hint}"),
+                            (Err(error), None) => return Err(error),
+                        })
                     };
+                    if let Some(recovery) = recovery {
+                        recovery.discard()?;
+                    }
                     Ok((output, new_version))
                 }
                 .await;
@@ -913,20 +1072,32 @@ async fn run(cli: Cli) -> Result<i32> {
                             .tool
                             .as_ref()
                             .map(providers::recovery_hint)
-                            .unwrap_or_else(|| "Run `brew doctor`.".into());
+                            .unwrap_or_else(|| {
+                                if plan
+                                    .inventory
+                                    .as_ref()
+                                    .is_some_and(|report| report.kind == "agent-skill")
+                                {
+                                    format!("Run `beacon doctor {}` before retrying.", plan.id)
+                                } else {
+                                    "Run `brew doctor`.".into()
+                                }
+                            });
                         let detail = format!("upgrade failed: {summary}. {recovery}");
                         let target = if plan.tool.is_some() {
                             format!("tool:{}", plan.id)
                         } else {
                             format!("inventory:{}", plan.id)
                         };
-                        store.record(
+                        store.record_scoped(
                             "upgrade",
                             &plan.id,
                             plan.current.as_deref(),
                             None,
                             &plan.source,
                             &plan.updater,
+                            &plan.resource_scope,
+                            plan.scope_locator.as_deref(),
                             "failed",
                             &detail,
                         )?;
@@ -949,13 +1120,15 @@ async fn run(cli: Cli) -> Result<i32> {
                     &format!("{} {}", output.stdout, output.stderr),
                     home.as_deref(),
                 );
-                store.record(
+                store.record_scoped(
                     "upgrade",
                     &plan.id,
                     plan.current.as_deref(),
                     new_version.as_deref(),
                     &plan.source,
                     &plan.updater,
+                    &plan.resource_scope,
+                    plan.scope_locator.as_deref(),
                     "success",
                     &summary,
                 )?;
@@ -976,6 +1149,8 @@ async fn run(cli: Cli) -> Result<i32> {
                     update_manager: plan.updater.clone(),
                     status: "success".into(),
                     action: plan.action.clone(),
+                    resource_scope: plan.resource_scope.clone(),
+                    scope_locator: plan.scope_locator.clone(),
                 });
             }
             store.prune(config.history_limit)?;
@@ -1212,23 +1387,34 @@ async fn run(cli: Cli) -> Result<i32> {
                 }
             }
             ConfigCommand::Inventories(args) => {
-                let supported = vec!["homebrew".to_string()];
+                let supported = vec!["homebrew".to_string(), "skills".to_string()];
                 match args.command {
                     None => {
                         let ui = Ui::new(args.json, cli.verbose, cli.no_color);
                         let available = providers::available_inventories(&config, &ui).await;
-                        let items = vec![ConfigItemStatus {
-                            id: "homebrew".into(),
-                            name: "Homebrew".into(),
-                            enabled: config.enabled_inventories.iter().any(|id| id == "homebrew"),
-                            installed: available.iter().any(|id| id == "homebrew"),
-                            detail: None,
-                        }];
+                        let items = [
+                            ("homebrew", "Homebrew"),
+                            ("skills", "Agent Skills"),
+                        ]
+                        .into_iter()
+                        .map(|(id, name)| {
+                            let installed = available.iter().any(|available| available == id);
+                            ConfigItemStatus {
+                                id: id.into(),
+                                name: name.into(),
+                                enabled: config.enabled_inventories.iter().any(|item| item == id),
+                                installed,
+                                detail: (!installed && id == "skills").then(|| {
+                                    "requires npx or bunx able to execute skills@^1.5.18 with list --json".into()
+                                }),
+                            }
+                        })
+                        .collect::<Vec<_>>();
                         if args.json {
                             print_envelope(&Envelope::ok(items))?;
                         } else {
                             println!(
-                                "{:<12} {:<18} {:<10} INSTALLED",
+                                "{:<12} {:<18} {:<10} AVAILABLE",
                                 "ID", "INVENTORY", "ENABLED"
                             );
                             for item in items {
@@ -1291,8 +1477,10 @@ async fn run(cli: Cli) -> Result<i32> {
                         print_config_change(&change, args.json)?;
                     }
                     Some(InventoryConfigCommand::Reset) => {
+                        let ui = Ui::new(args.json, cli.verbose, cli.no_color);
+                        let available = providers::available_inventories(&config, &ui).await;
                         let before = config.enabled_inventories.clone();
-                        config.enabled_inventories = supported.clone();
+                        config.enabled_inventories = ordered(available, &supported);
                         config.disabled_inventories.clear();
                         config::save_to(&config, &config_path)?;
                         let change = config_change(
@@ -1314,21 +1502,25 @@ async fn run(cli: Cli) -> Result<i32> {
                                 "`beacon config inventories edit` requires an interactive terminal"
                             );
                         }
-                        let defaults =
-                            vec![config.enabled_inventories.iter().any(|id| id == "homebrew")];
+                        let defaults = supported
+                            .iter()
+                            .map(|id| config.enabled_inventories.contains(id))
+                            .collect::<Vec<_>>();
                         let selected = MultiSelect::new()
                             .with_prompt("Select inventories")
-                            .items(&["Homebrew (homebrew)"])
+                            .items(&["Homebrew (homebrew)", "Agent Skills (skills)"])
                             .defaults(&defaults)
                             .interact()?;
                         let before = config.enabled_inventories.clone();
-                        config.enabled_inventories =
-                            selected.iter().map(|_| "homebrew".into()).collect();
-                        config.disabled_inventories = if selected.is_empty() {
-                            vec!["homebrew".into()]
-                        } else {
-                            Vec::new()
-                        };
+                        config.enabled_inventories = selected
+                            .iter()
+                            .map(|index| supported[*index].clone())
+                            .collect();
+                        config.disabled_inventories = supported
+                            .iter()
+                            .filter(|id| !config.enabled_inventories.contains(id))
+                            .cloned()
+                            .collect();
                         config::save_to(&config, &config_path)?;
                         let change = config_change(
                             &config_path,

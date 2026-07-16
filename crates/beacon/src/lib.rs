@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 pub mod command {
     use anyhow::{Result, bail};
     use serde::{Deserialize, Serialize};
+    use std::{collections::BTreeMap, path::PathBuf};
 
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
     pub struct CommandSpec {
@@ -10,6 +11,12 @@ pub mod command {
         pub args: Vec<String>,
         #[serde(skip, default)]
         pub accepted_exit_codes: Vec<i32>,
+        #[serde(skip, default)]
+        pub current_dir: Option<PathBuf>,
+        #[serde(skip, default)]
+        pub environment: BTreeMap<String, String>,
+        #[serde(skip, default)]
+        pub removed_environment: Vec<String>,
     }
 
     impl CommandSpec {
@@ -21,11 +28,33 @@ pub mod command {
                 program: program.into(),
                 args: args.into_iter().map(Into::into).collect(),
                 accepted_exit_codes: Vec::new(),
+                current_dir: None,
+                environment: BTreeMap::new(),
+                removed_environment: Vec::new(),
             }
         }
 
         pub fn accepting_exit_code(mut self, code: i32) -> Self {
             self.accepted_exit_codes.push(code);
+            self
+        }
+
+        pub fn in_directory(mut self, path: impl Into<PathBuf>) -> Self {
+            self.current_dir = Some(path.into());
+            self
+        }
+
+        pub fn with_environment(
+            mut self,
+            key: impl Into<String>,
+            value: impl Into<String>,
+        ) -> Self {
+            self.environment.insert(key.into(), value.into());
+            self
+        }
+
+        pub fn removing_environment(mut self, key: impl Into<String>) -> Self {
+            self.removed_environment.push(key.into());
             self
         }
 
@@ -433,6 +462,57 @@ pub struct InventoryReport {
     pub latest: Option<providers::ToolVersion>,
     pub action: Option<providers::UpgradeAction>,
     pub detail: Option<String>,
+    #[serde(default)]
+    pub scope: ResourceScope,
+    pub installation_source: Option<String>,
+    pub source_locator: Option<String>,
+    pub update_manager: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub changes: Vec<InventoryChange>,
+    #[serde(skip, default)]
+    pub runtime: InventoryRuntime,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ResourceScope {
+    #[default]
+    System,
+    Global,
+    Project,
+}
+
+impl ResourceScope {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::System => "system",
+            Self::Global => "global",
+            Self::Project => "project",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InventoryChange {
+    pub path: String,
+    pub kind: InventoryChangeKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum InventoryChangeKind {
+    Added,
+    Modified,
+    Removed,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct InventoryRuntime {
+    pub canonical_path: Option<std::path::PathBuf>,
+    pub receipt_path: Option<std::path::PathBuf>,
+    pub project_root: Option<std::path::PathBuf>,
+    pub manager_path: Option<std::path::PathBuf>,
+    pub manager_version: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -465,11 +545,13 @@ pub mod config {
         pub enabled_inventories: Vec<String>,
         pub disabled_inventories: Vec<String>,
         pub tool_catalog_version: u32,
+        pub inventory_catalog_version: u32,
         pub history_limit: usize,
         pub command_timeout_seconds: u64,
     }
 
     pub const TOOL_CATALOG_VERSION: u32 = 1;
+    pub const INVENTORY_CATALOG_VERSION: u32 = 1;
 
     pub fn tool_catalog_entry_version(id: &str) -> u32 {
         match id {
@@ -478,15 +560,24 @@ pub mod config {
         }
     }
 
+    pub fn inventory_catalog_entry_version(id: &str) -> u32 {
+        match id {
+            "homebrew" => 0,
+            "skills" => 1,
+            _ => INVENTORY_CATALOG_VERSION,
+        }
+    }
+
     impl Default for Config {
         fn default() -> Self {
             Self {
-                schema_version: 3,
+                schema_version: 4,
                 enabled_tools: Vec::new(),
                 disabled_tools: Vec::new(),
                 enabled_inventories: Vec::new(),
                 disabled_inventories: Vec::new(),
                 tool_catalog_version: 0,
+                inventory_catalog_version: 0,
                 history_limit: 500,
                 command_timeout_seconds: 120,
             }
@@ -513,8 +604,8 @@ pub mod config {
         let config: Config =
             toml::from_str(&fs::read_to_string(path)?).context("invalid Beacon config")?;
         match config.schema_version {
-            3 => Ok(config),
-            version if version > 3 => bail!("unsupported Beacon config schema version {version}"),
+            4 => Ok(config),
+            version if version > 4 => bail!("unsupported Beacon config schema version {version}"),
             version => bail!("Beacon config schema version {version} requires migration"),
         }
     }
@@ -544,6 +635,7 @@ pub mod config {
             document["enabled_inventories"] = value(array(&config.enabled_inventories));
             document["disabled_inventories"] = value(array(&config.disabled_inventories));
             document["tool_catalog_version"] = value(config.tool_catalog_version as i64);
+            document["inventory_catalog_version"] = value(config.inventory_catalog_version as i64);
             document["history_limit"] = value(config.history_limit as i64);
             document["command_timeout_seconds"] = value(config.command_timeout_seconds as i64);
             atomic_write(path, document.to_string().as_bytes())?;
@@ -574,7 +666,7 @@ pub mod config {
             .get("schema_version")
             .and_then(|item| item.as_integer())
             .unwrap_or(1);
-        if version > 3 {
+        if version > 4 {
             bail!("unsupported Beacon config schema version {version}");
         }
         if version >= 2 {
@@ -626,7 +718,7 @@ pub mod config {
             .get("schema_version")
             .and_then(|item| item.as_integer())
             .unwrap_or(1);
-        if version > 3 {
+        if version > 4 {
             bail!("unsupported Beacon config schema version {version}");
         }
         if version != 2 {
@@ -653,36 +745,82 @@ pub mod config {
         Ok(())
     }
 
+    fn migrate_v3(path: &Path, source: &str) -> Result<()> {
+        use toml_edit::{DocumentMut, value};
+
+        let mut document = source
+            .parse::<DocumentMut>()
+            .context("invalid Beacon config")?;
+        let version = document
+            .get("schema_version")
+            .and_then(|item| item.as_integer())
+            .unwrap_or(1);
+        if version > 4 {
+            bail!("unsupported Beacon config schema version {version}");
+        }
+        if version != 3 {
+            return Ok(());
+        }
+
+        let backup = path.with_file_name("config.toml.v3.bak");
+        if !backup.exists() {
+            atomic_write(&backup, source.as_bytes())?;
+        }
+        document["schema_version"] = value(4);
+        document["inventory_catalog_version"] = value(0);
+        atomic_write(path, document.to_string().as_bytes())?;
+        Ok(())
+    }
+
     pub fn initialize_catalog(
         config: &mut Config,
         available_tools: &[String],
         available_inventories: &[String],
     ) -> bool {
-        if config.tool_catalog_version >= TOOL_CATALOG_VERSION {
-            return false;
-        }
-        if config.tool_catalog_version == 0 {
-            config.enabled_tools = available_tools
-                .iter()
-                .filter(|id| !config.disabled_tools.contains(id))
-                .cloned()
-                .collect();
-        } else {
-            for id in available_tools {
-                let introduced_in = tool_catalog_entry_version(id);
-                if introduced_in > config.tool_catalog_version
-                    && !config.disabled_tools.contains(id)
-                    && !config.enabled_tools.contains(id)
-                {
-                    config.enabled_tools.push(id.clone());
+        let mut changed = false;
+        if config.tool_catalog_version < TOOL_CATALOG_VERSION {
+            if config.tool_catalog_version == 0 {
+                config.enabled_tools = available_tools
+                    .iter()
+                    .filter(|id| !config.disabled_tools.contains(id))
+                    .cloned()
+                    .collect();
+            } else {
+                for id in available_tools {
+                    let introduced_in = tool_catalog_entry_version(id);
+                    if introduced_in > config.tool_catalog_version
+                        && !config.disabled_tools.contains(id)
+                        && !config.enabled_tools.contains(id)
+                    {
+                        config.enabled_tools.push(id.clone());
+                    }
                 }
             }
+            config.tool_catalog_version = TOOL_CATALOG_VERSION;
+            changed = true;
         }
-        if config.enabled_inventories.is_empty() && config.disabled_inventories.is_empty() {
-            config.enabled_inventories = available_inventories.to_vec();
+
+        if config.inventory_catalog_version < INVENTORY_CATALOG_VERSION {
+            if config.inventory_catalog_version == 0
+                && config.enabled_inventories.is_empty()
+                && config.disabled_inventories.is_empty()
+            {
+                config.enabled_inventories = available_inventories.to_vec();
+            } else {
+                for id in available_inventories {
+                    let introduced_in = inventory_catalog_entry_version(id);
+                    if introduced_in > config.inventory_catalog_version
+                        && !config.disabled_inventories.contains(id)
+                        && !config.enabled_inventories.contains(id)
+                    {
+                        config.enabled_inventories.push(id.clone());
+                    }
+                }
+            }
+            config.inventory_catalog_version = INVENTORY_CATALOG_VERSION;
+            changed = true;
         }
-        config.tool_catalog_version = TOOL_CATALOG_VERSION;
-        true
+        changed
     }
     pub fn ensure() -> Result<(Config, PathBuf)> {
         let path = path()?;
@@ -695,6 +833,8 @@ pub mod config {
             migrate_v1(path, &source)?;
             let source = fs::read_to_string(path)?;
             migrate_v2(path, &source)?;
+            let source = fs::read_to_string(path)?;
+            migrate_v3(path, &source)?;
         }
         let config = load_from(path)?;
         if !path.exists() {
@@ -870,6 +1010,13 @@ pub mod runner {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+        if let Some(path) = &spec.current_dir {
+            command.current_dir(path);
+        }
+        command.envs(&spec.environment);
+        for key in &spec.removed_environment {
+            command.env_remove(key);
+        }
         let mut child = command.spawn()?;
         let stdout = child
             .stdout
@@ -977,6 +1124,25 @@ pub mod store {
         )
     }
 
+    fn history_v3_ddl(table: &str) -> String {
+        format!(
+            "CREATE TABLE {table} (
+                    id INTEGER PRIMARY KEY,
+                    created_at TEXT NOT NULL,
+                    operation TEXT NOT NULL,
+                    tool TEXT NOT NULL,
+                    old_version TEXT,
+                    new_version TEXT,
+                    installation_source TEXT NOT NULL DEFAULT 'unknown',
+                    update_manager TEXT NOT NULL DEFAULT 'unknown',
+                    resource_scope TEXT NOT NULL DEFAULT 'system',
+                    scope_locator TEXT,
+                    status TEXT NOT NULL,
+                    summary TEXT NOT NULL
+                )"
+        )
+    }
+
     fn snapshots_v2_ddl(table: &str) -> String {
         format!(
             "CREATE TABLE {table} (
@@ -998,6 +1164,8 @@ pub mod store {
         pub new_version: Option<String>,
         pub installation_source: String,
         pub update_manager: String,
+        pub resource_scope: String,
+        pub scope_locator: Option<String>,
         pub status: String,
         pub summary: String,
     }
@@ -1008,6 +1176,12 @@ pub mod store {
         pub created_at: String,
         pub payload: String,
         pub payload_schema_version: u8,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct SkillBaseline {
+        pub receipt_fingerprint: String,
+        pub content_revision: String,
     }
 
     pub struct Store {
@@ -1029,7 +1203,7 @@ pub mod store {
             let current_version: i64 =
                 self.connection
                     .pragma_query_value(None, "user_version", |row| row.get(0))?;
-            if current_version > 2 {
+            if current_version > 3 {
                 bail!("unsupported Beacon database schema version {current_version}");
             }
             self.connection.execute_batch("PRAGMA journal_mode=WAL;")?;
@@ -1038,8 +1212,10 @@ pub mod store {
             // breaks subsequent inserts; heal that intermediate shape on open.
             let transaction = self.connection.transaction()?;
             migrate_history_to_v2(&transaction)?;
+            migrate_history_to_v3(&transaction)?;
             migrate_snapshots_to_v2(&transaction)?;
-            transaction.pragma_update(None, "user_version", 2)?;
+            migrate_skill_baselines(&transaction)?;
+            transaction.pragma_update(None, "user_version", 3)?;
             transaction.commit()?;
             Ok(())
         }
@@ -1056,8 +1232,36 @@ pub mod store {
             status: &str,
             summary: &str,
         ) -> Result<()> {
+            self.record_scoped(
+                operation,
+                tool,
+                old,
+                new,
+                installation_source,
+                update_manager,
+                "system",
+                None,
+                status,
+                summary,
+            )
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        pub fn record_scoped(
+            &self,
+            operation: &str,
+            tool: &str,
+            old: Option<&str>,
+            new: Option<&str>,
+            installation_source: &str,
+            update_manager: &str,
+            resource_scope: &str,
+            scope_locator: Option<&str>,
+            status: &str,
+            summary: &str,
+        ) -> Result<()> {
             self.connection.execute(
-                "INSERT INTO history(created_at,operation,tool,old_version,new_version,installation_source,update_manager,status,summary) VALUES(?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO history(created_at,operation,tool,old_version,new_version,installation_source,update_manager,resource_scope,scope_locator,status,summary) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                 params![
                     Utc::now().to_rfc3339(),
                     operation,
@@ -1066,6 +1270,8 @@ pub mod store {
                     new,
                     installation_source,
                     update_manager,
+                    resource_scope,
+                    scope_locator,
                     status,
                     summary
                 ],
@@ -1081,9 +1287,61 @@ pub mod store {
             Ok(())
         }
 
+        pub fn skill_baseline(
+            &self,
+            resource_scope: &str,
+            scope_locator: &str,
+            skill_name: &str,
+        ) -> Result<Option<SkillBaseline>> {
+            let mut statement = self.connection.prepare(
+                "SELECT receipt_fingerprint, content_revision
+                 FROM skill_baselines
+                 WHERE resource_scope = ? AND scope_locator = ? AND skill_name = ?",
+            )?;
+            let mut rows = statement.query(params![resource_scope, scope_locator, skill_name])?;
+            Ok(rows
+                .next()?
+                .map(|row| {
+                    Ok::<_, rusqlite::Error>(SkillBaseline {
+                        receipt_fingerprint: row.get(0)?,
+                        content_revision: row.get(1)?,
+                    })
+                })
+                .transpose()?)
+        }
+
+        pub fn upsert_skill_baseline(
+            &self,
+            resource_scope: &str,
+            scope_locator: &str,
+            skill_name: &str,
+            receipt_fingerprint: &str,
+            content_revision: &str,
+        ) -> Result<()> {
+            self.connection.execute(
+                "INSERT INTO skill_baselines(
+                    resource_scope, scope_locator, skill_name, receipt_fingerprint,
+                    content_revision, observed_at
+                 ) VALUES(?,?,?,?,?,?)
+                 ON CONFLICT(resource_scope, scope_locator, skill_name) DO UPDATE SET
+                    receipt_fingerprint = excluded.receipt_fingerprint,
+                    content_revision = excluded.content_revision,
+                    observed_at = excluded.observed_at",
+                params![
+                    resource_scope,
+                    scope_locator,
+                    skill_name,
+                    receipt_fingerprint,
+                    content_revision,
+                    Utc::now().to_rfc3339()
+                ],
+            )?;
+            Ok(())
+        }
+
         pub fn history(&self, limit: usize) -> Result<Vec<HistoryEntry>> {
             let mut statement = self.connection.prepare(
-                "SELECT id,created_at,operation,tool,old_version,new_version,installation_source,update_manager,status,summary FROM history ORDER BY id DESC LIMIT ?",
+                "SELECT id,created_at,operation,tool,old_version,new_version,installation_source,update_manager,resource_scope,scope_locator,status,summary FROM history ORDER BY id DESC LIMIT ?",
             )?;
             Ok(statement
                 .query_map([limit as i64], |row| {
@@ -1096,8 +1354,10 @@ pub mod store {
                         new_version: row.get(5)?,
                         installation_source: row.get(6)?,
                         update_manager: row.get(7)?,
-                        status: row.get(8)?,
-                        summary: row.get(9)?,
+                        resource_scope: row.get(8)?,
+                        scope_locator: row.get(9)?,
+                        status: row.get(10)?,
+                        summary: row.get(11)?,
                     })
                 })?
                 .collect::<Result<Vec<_>, _>>()?)
@@ -1186,6 +1446,37 @@ pub mod store {
         Ok(())
     }
 
+    fn migrate_history_to_v3(transaction: &Transaction<'_>) -> Result<()> {
+        let columns = table_columns(transaction, "history")?;
+        require_history_columns(&columns)?;
+        let has_scope = columns.iter().any(|column| column == "resource_scope");
+        let has_locator = columns.iter().any(|column| column == "scope_locator");
+        if has_scope && has_locator {
+            return Ok(());
+        }
+        if has_scope || has_locator {
+            bail!("cannot migrate history table: incomplete scoped history columns");
+        }
+
+        transaction.execute_batch("DROP TABLE IF EXISTS history_v3_migration;")?;
+        transaction.execute_batch(&history_v3_ddl("history_v3_migration"))?;
+        transaction.execute_batch(
+            "INSERT INTO history_v3_migration(
+                id, created_at, operation, tool, old_version, new_version,
+                installation_source, update_manager, resource_scope, scope_locator,
+                status, summary
+            )
+            SELECT
+                id, created_at, operation, tool, old_version, new_version,
+                installation_source, update_manager, 'system', NULL,
+                status, summary
+            FROM history;
+            DROP TABLE history;
+            ALTER TABLE history_v3_migration RENAME TO history;",
+        )?;
+        Ok(())
+    }
+
     fn migrate_snapshots_to_v2(transaction: &Transaction<'_>) -> Result<()> {
         if !table_exists(transaction, "snapshots")? {
             transaction.execute_batch(&snapshots_v2_ddl("snapshots"))?;
@@ -1211,6 +1502,21 @@ pub mod store {
         transaction.execute_batch(
             "DROP TABLE snapshots;
              ALTER TABLE snapshots_v2_migration RENAME TO snapshots;",
+        )?;
+        Ok(())
+    }
+
+    fn migrate_skill_baselines(transaction: &Transaction<'_>) -> Result<()> {
+        transaction.execute_batch(
+            "CREATE TABLE IF NOT EXISTS skill_baselines (
+                resource_scope TEXT NOT NULL,
+                scope_locator TEXT NOT NULL DEFAULT '',
+                skill_name TEXT NOT NULL,
+                receipt_fingerprint TEXT NOT NULL,
+                content_revision TEXT NOT NULL,
+                observed_at TEXT NOT NULL,
+                PRIMARY KEY(resource_scope, scope_locator, skill_name)
+            );",
         )?;
         Ok(())
     }
@@ -1264,4 +1570,5 @@ pub mod store {
     }
 }
 
+pub mod agent_skills;
 pub mod providers;
