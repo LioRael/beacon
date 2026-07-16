@@ -25,9 +25,9 @@ You can also download the Apple Silicon archive from the
 installing:
 
 ```bash
-shasum -a 256 -c beacon-v0.4.0-aarch64-apple-darwin.tar.gz.sha256
-tar -xzf beacon-v0.4.0-aarch64-apple-darwin.tar.gz
-install -m 755 beacon-v0.4.0-aarch64-apple-darwin/beacon /usr/local/bin/beacon
+shasum -a 256 -c beacon-v0.4.1-aarch64-apple-darwin.tar.gz.sha256
+tar -xzf beacon-v0.4.1-aarch64-apple-darwin.tar.gz
+install -m 755 beacon-v0.4.1-aarch64-apple-darwin/beacon /usr/local/bin/beacon
 ```
 
 Prebuilt binaries require Apple Silicon and macOS 15 Sequoia or newer. Installing from Cargo
@@ -67,6 +67,8 @@ Machine output always uses a schema v2 envelope with `tools` and `inventories` a
 
 Beacon delegates Agent Skill discovery and updates to the [`skills`](https://www.npmjs.com/package/skills) npm CLI through a package runner; it does not require or install a global `skills` executable and does not add a separate `beacon skills` command. Beacon prefers `npx --yes skills@^1.5.18` and falls back to `bunx skills@^1.5.18`. The runner may resolve and cache that package using its normal cache, while the resolved CLI must remain in the supported `>=1.5.18,<2.0.0` range. Enable or disable this integration through `beacon config inventories`.
 
+Beacon selects the runner with a lightweight temporary-project capability probe, lists each requested Skill scope once, and reports progress during human-facing checks. Machine-readable list output is captured completely before JSON parsing; a selected runner's scope-discovery failure is reported directly instead of repeating the same work through a second runner.
+
 `beacon check` combines global Skills with Skills from the nearest project `skills-lock.json` (or current Git worktree). Items use `skill:global:<name>` and `skill:project:<name>` IDs. Beacon plans updates by running `skills update <name> --global|--project --yes` in a temporary mirror, with telemetry disabled, then reports the full content SHA-256 and added/modified/removed file paths without changing the real Skill. Local, legacy, `node_modules`, untracked, or locally modified Skills remain visible as unmanaged.
 
 Only a confirmed `beacon upgrade` invokes `skills` against the real scope. The Skills CLI remains the sole owner of agent-specific copies and links. Beacon keeps a temporary recovery copy of the canonical Skill and receipt during the operation; on failure it retains that copy for manual recovery and does not attempt to reconstruct agent topology.
@@ -104,7 +106,7 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 node --test packages/npm/test/*.test.mjs tests/*.test.mjs
-node scripts/verify-release-version.mjs v0.4.0
+node scripts/verify-release-version.mjs v0.4.1
 ```
 
 ## Distribution setup

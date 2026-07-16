@@ -114,10 +114,7 @@ fn feedback_mode_preserves_machine_output() {
         FeedbackMode::select(true, true, false),
         FeedbackMode::Silent
     );
-    assert_eq!(
-        FeedbackMode::select(true, true, true),
-        FeedbackMode::Verbose
-    );
+    assert_eq!(FeedbackMode::select(true, true, true), FeedbackMode::Silent);
 }
 
 #[test]

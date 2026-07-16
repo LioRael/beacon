@@ -165,14 +165,12 @@ async fn probe_runner(package_runner: PackageRunner, timeout_seconds: u64) -> Re
     if !requirement.matches(&skills_version) {
         bail!("unsupported skills version {skills_version}; Beacon requires >=1.5.18,<2.0.0");
     }
-    let list_output = runner::run(
-        &package_command(&runner_path, package_runner, ["list", "--global", "--json"]),
-        timeout_seconds,
-    )
-    .await
-    .with_context(|| {
-        format!("`{executable} {PACKAGE_SPEC}` does not support `list --global --json`")
-    })?;
+    let probe_dir = TempDir::new()?;
+    let list_command = package_command(&runner_path, package_runner, ["list", "--json"])
+        .in_directory(probe_dir.path());
+    let list_output = runner::run(&list_command, timeout_seconds)
+        .await
+        .with_context(|| format!("`{executable} {PACKAGE_SPEC}` does not support `list --json`"))?;
     serde_json::from_str::<Vec<ListedSkill>>(&list_output.stdout)
         .context("`skills list --json` returned an unsupported shape")?;
     Ok(Capability {
@@ -192,7 +190,7 @@ pub async fn inventory(timeout_seconds: u64, store: Option<&Store>) -> Vec<Inven
         Ok(root) => root,
         Err(error) => return vec![manager_failure(error.to_string())],
     };
-    let global_output = match runner::run(
+    let global_output = match runner::run_machine_output(
         &capability.command(["list", "--global", "--json"]),
         timeout_seconds,
     )
@@ -213,7 +211,7 @@ pub async fn inventory(timeout_seconds: u64, store: Option<&Store>) -> Vec<Inven
     let mut reports = Vec::new();
     if let Some(root) = &project_root {
         let command = capability.command(["list", "--json"]).in_directory(root);
-        match runner::run(&command, timeout_seconds).await {
+        match runner::run_machine_output(&command, timeout_seconds).await {
             Ok(output) => match serde_json::from_str::<Vec<ListedSkill>>(&output.stdout) {
                 Ok(mut project) => listed.append(&mut project),
                 Err(error) => reports.push(scope_failure(format!(

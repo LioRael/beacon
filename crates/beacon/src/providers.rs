@@ -2091,8 +2091,10 @@ pub async fn check_all_with_store(
     let context = ProviderContext::new(&executor, ui, config.command_timeout_seconds);
     let mut data = check_all_with_context(config, refresh, &context).await?;
     if config.enabled_inventories.iter().any(|id| id == "skills") {
-        data.inventories
-            .extend(crate::agent_skills::inventory(config.command_timeout_seconds, store).await);
+        ui.start_progress("Checking Agent Skills");
+        let skills = crate::agent_skills::inventory(config.command_timeout_seconds, store).await;
+        ui.finish_progress();
+        data.inventories.extend(skills);
         data.inventories
             .sort_by(|left, right| left.id.cmp(&right.id));
     }
